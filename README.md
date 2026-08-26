@@ -163,3 +163,5 @@ Notes for a clean Windows build:
 5. **Run this on a machine with network access** and fix whatever
    surfaces on the first real `python main.py` - see the limitation note
    above.
+## **NOTE**
+انا افجر واحد في بلدكوووووووووووووو
