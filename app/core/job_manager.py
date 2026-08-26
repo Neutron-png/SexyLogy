@@ -23,6 +23,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from app.core.engine import scrapling_adapter as engine
 from app.core.engine import ai_extractor
+from app.core.engine.dedupe import fingerprint_lead
 from app.core.engine.extractor import extract_fields, extract_records, ExtractionError
 from app.core.engine.qualifier import qualify_html
 from app.core.models import ExtractionField, JobStatus, TargetConfig, ScrapeOptions, LogLevel
@@ -119,6 +120,7 @@ class ScrapeJobWorker(QObject):
             pages_done = 0
             records_ok = 0
             records_failed = 0
+            duplicates_skipped = 0  # leads whose fingerprint was already in lead_history (see dedupe.py)
             pages_total = max(len(queue), self.target.max_pages)
             first_page = True  # no delay before the very first fetch
 
@@ -189,8 +191,26 @@ class ScrapeJobWorker(QObject):
                         self._qualify_lead(record, url)
                     if self.options.owner_lookup_enabled:
                         self._lookup_owner_contact_info(record, url)
+
+                    # Cross-job lead history (spec: "هيستوري لليدز اللي طلعت
+                    # مسبقا متتكررش كل ما نجينيريت ليدز") - skip a record
+                    # that ANY earlier job already produced, so re-running
+                    # the same niche/search later surfaces only new leads
+                    # instead of re-saving/re-counting old ones. Computed
+                    # even when skip_duplicate_leads is off (so it's ready
+                    # for later runs where it's on), but only USED to skip
+                    # when the option is enabled.
+                    fingerprint = fingerprint_lead(record)
+                    if self.options.skip_duplicate_leads and fingerprint and self.db.lead_seen_before(fingerprint):
+                        duplicates_skipped += 1
+                        label = record.get("name") or record.get("company_name") or record.get("email") or url
+                        self._emit_log(LogLevel.INFO, f"تم تخطي ليد مكرر (ظهر من قبل): {label}")
+                        continue
+
                     self.db.add_result(self.job_id, url, record)
                     records_ok += 1
+                    if fingerprint:
+                        self.db.record_lead_seen(fingerprint, self.project_id, self.job_id, record)
                     self.result_ready.emit(record)
                 self._emit_log(LogLevel.SUCCESS, f"{len(records)} سجل تم استخراجه من {url}")
 
@@ -213,9 +233,12 @@ class ScrapeJobWorker(QObject):
             final_status = JobStatus.STOPPED if self._stop_requested else JobStatus.COMPLETED
             self.db.finish_job(self.job_id, final_status.value)
             self.status_changed.emit(final_status.value)
+            summary = f"انتهت المهمة: {final_status.value} - {records_ok} سجل ناجح، {records_failed} خطأ"
+            if duplicates_skipped:
+                summary += f"، {duplicates_skipped} ليد مكرر تم تخطيه (ظهر في سكرابنج سابق)"
             self._emit_log(
                 LogLevel.SUCCESS if final_status == JobStatus.COMPLETED else LogLevel.WARNING,
-                f"انتهت المهمة: {final_status.value} - {records_ok} سجل ناجح، {records_failed} خطأ",
+                summary,
             )
         except Exception as e:  # never let one bad page crash the whole run/app
             tb = traceback.format_exc()

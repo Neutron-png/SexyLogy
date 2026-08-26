@@ -84,6 +84,63 @@ def test_delete_project_cascades_nothing_breaks():
         assert db.list_projects() == []
 
 
+def test_lead_history_records_and_detects_duplicates():
+    with temp_db() as db:
+        pid = db.create_project("P", {})
+        job_id = db.create_job(pid)
+
+        assert db.lead_seen_before("fp-1") is None
+        db.record_lead_seen("fp-1", pid, job_id, {"name": "Henry", "email": "henry@elight.com"})
+
+        seen = db.lead_seen_before("fp-1")
+        assert seen is not None
+        assert seen["times_seen"] == 1
+        assert db.count_lead_history() == 1
+
+        # A later job re-generating the same lead just bumps times_seen
+        # instead of erroring or duplicating the row (PRIMARY KEY on
+        # fingerprint) - this is what job_manager.py relies on.
+        job_id_2 = db.create_job(pid)
+        db.record_lead_seen("fp-1", pid, job_id_2, {"name": "Henry", "email": "henry@elight.com"})
+        seen_again = db.lead_seen_before("fp-1")
+        assert seen_again["times_seen"] == 2
+        assert seen_again["job_id"] == job_id_2
+        assert db.count_lead_history() == 1
+
+
+def test_lead_history_search_and_clear():
+    with temp_db() as db:
+        pid = db.create_project("P", {})
+        job_id = db.create_job(pid)
+        db.record_lead_seen("fp-a", pid, job_id, {"name": "Henry Jordan", "company_name": "E-light"})
+        db.record_lead_seen("fp-b", pid, job_id, {"name": "Robin Smith", "company_name": "Global Solutions"})
+
+        assert len(db.list_lead_history()) == 2
+        matches = db.list_lead_history(search="Henry")
+        assert len(matches) == 1
+        assert "Henry" in matches[0]["data_json"]
+
+        db.delete_lead_history_entry("fp-a")
+        assert db.count_lead_history() == 1
+
+        db.clear_lead_history()
+        assert db.count_lead_history() == 0
+        assert db.list_lead_history() == []
+
+
+def test_lead_history_survives_project_deletion():
+    """Deleting a project/job must NOT erase the de-dup memory those leads
+    came from - otherwise deleting old History entries would silently
+    un-block their leads from being re-generated. lead_history has no FK/
+    cascade to projects or jobs on purpose (see db.py's SCHEMA comment)."""
+    with temp_db() as db:
+        pid = db.create_project("P", {})
+        job_id = db.create_job(pid)
+        db.record_lead_seen("fp-1", pid, job_id, {"email": "a@x.com"})
+        db.delete_project(pid)
+        assert db.lead_seen_before("fp-1") is not None
+
+
 def test_db_usable_from_a_background_thread():
     """Regression test for the bug that made Stop/progress/log all appear
     broken at once: the Database was opened with sqlite3's default

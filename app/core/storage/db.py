@@ -74,6 +74,26 @@ CREATE TABLE IF NOT EXISTS templates (
     config_json TEXT NOT NULL,
     builtin INTEGER NOT NULL DEFAULT 0
 );
+
+-- Cross-job lead history, used to de-duplicate leads across every scrape
+-- ever run (not just within one job) - see app/core/engine/dedupe.py for
+-- how `fingerprint` is computed and app/core/job_manager.py for where a
+-- fingerprint already in this table causes a newly-extracted record to be
+-- skipped instead of re-saved. Deliberately has NO foreign key / ON DELETE
+-- CASCADE to jobs/projects: the whole point of this table is to keep
+-- remembering a lead was already generated even after the job (or project)
+-- that first produced it is deleted from History, so deleting old jobs
+-- never silently un-blocks their leads for re-generation.
+CREATE TABLE IF NOT EXISTS lead_history (
+    fingerprint TEXT PRIMARY KEY,
+    project_id INTEGER,
+    job_id INTEGER,
+    data_json TEXT NOT NULL,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    times_seen INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_lead_history_last_seen ON lead_history(last_seen_at);
 """
 
 
@@ -262,6 +282,60 @@ class Database:
     def clear_logs(self) -> None:
         with self.cursor() as cur:
             cur.execute("DELETE FROM logs")
+
+    # ---------------- Lead history (cross-job de-duplication) ----------------
+    def lead_seen_before(self, fingerprint: str) -> Optional[dict]:
+        """Returns the existing lead_history row for this fingerprint, or
+        None if this lead has never been generated before."""
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM lead_history WHERE fingerprint = ?", (fingerprint,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def record_lead_seen(self, fingerprint: str, project_id: Optional[int], job_id: Optional[int], data: dict) -> None:
+        """Remembers a lead as seen. Safe to call for a fingerprint that's
+        already recorded (e.g. a lead that keeps showing up in every run
+        while skip_duplicate_leads is off) - just bumps times_seen/last_seen
+        instead of erroring on the PRIMARY KEY."""
+        now = time.time()
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO lead_history "
+                "(fingerprint, project_id, job_id, data_json, first_seen_at, last_seen_at, times_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(fingerprint) DO UPDATE SET "
+                "last_seen_at = excluded.last_seen_at, job_id = excluded.job_id, "
+                "times_seen = times_seen + 1",
+                (fingerprint, project_id, job_id, json.dumps(data, ensure_ascii=False), now, now),
+            )
+
+    def list_lead_history(self, search: Optional[str] = None, limit: int = 5000) -> list[dict]:
+        query = "SELECT * FROM lead_history"
+        params: list[Any] = []
+        if search:
+            query += " WHERE data_json LIKE ?"
+            params.append(f"%{search}%")
+        query += " ORDER BY last_seen_at DESC LIMIT ?"
+        params.append(limit)
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    def count_lead_history(self) -> int:
+        with self.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM lead_history")
+            return cur.fetchone()[0]
+
+    def clear_lead_history(self) -> None:
+        """Forgets every lead ever seen - the user's explicit escape hatch
+        for when they actually WANT previously-generated leads to be
+        eligible for re-generation again (e.g. starting a fresh campaign)."""
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM lead_history")
+
+    def delete_lead_history_entry(self, fingerprint: str) -> None:
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM lead_history WHERE fingerprint = ?", (fingerprint,))
 
     # ---------------- Settings ----------------
     def get_setting(self, key: str, default: Any = None) -> Any:

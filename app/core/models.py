@@ -130,6 +130,15 @@ class ScrapeOptions:
     # needs a real key saved on the API Keys screen). See
     # job_manager.ScrapeJobWorker._lookup_owner_contact_info().
     owner_lookup_enabled: bool = False
+    # Cross-job lead de-duplication ("history لليدز اللي طلعت مسبقا" -
+    # don't re-save/re-count a lead that a PREVIOUS job already produced).
+    # Checked against app/core/storage/db.py's lead_history table, which is
+    # keyed by app/core/engine/dedupe.fingerprint_lead() and survives across
+    # jobs/projects (not just within one run) - see job_manager.py's main
+    # loop for where this is enforced. On by default: the whole point of
+    # re-running the same scrape/niche later is to find NEW leads, not to
+    # keep re-collecting the same ones.
+    skip_duplicate_leads: bool = True
 
 
 @dataclass

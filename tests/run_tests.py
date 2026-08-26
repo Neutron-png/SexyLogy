@@ -21,6 +21,7 @@ TEST_MODULES = [
     "tests.test_ai_extractor",
     "tests.test_html_to_text",
     "tests.test_builtin_templates",
+    "tests.test_dedupe",
 ]
 
 

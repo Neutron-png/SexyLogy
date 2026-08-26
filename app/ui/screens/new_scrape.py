@@ -1041,6 +1041,22 @@ class NewScrapeScreen(QWidget):
         form.addRow("Fetcher mode", self.fetcher_combo)
         layout.addLayout(form)
 
+        # "هيستوري لليدز اللي طلعت مسبقا متتكررش كل ما نجينيريت ليدز" - skip
+        # a lead this run extracts if ANY earlier job already produced it
+        # (matched by email/phone/website/name+company - see
+        # app/core/engine/dedupe.py). Checked against the History screen's
+        # "Leads History" tab, which is exactly this same lead_history table.
+        self.skip_duplicates_chk = QCheckBox("Skip leads already generated before (cross-job de-duplication)")
+        self.skip_duplicates_chk.setChecked(True)
+        self.skip_duplicates_chk.setToolTip(
+            "Before saving a newly-extracted lead, LOGY checks it against every lead ANY previous "
+            "job has ever produced (matched by email, then phone, then website, then name+company). "
+            "A match is skipped instead of re-saved, so re-running the same niche/search later only "
+            "brings back new leads. Uncheck to allow the same lead to be generated again. See the "
+            "'Leads History' tab on the History screen, or 'Clear Leads History' there to reset it."
+        )
+        layout.addWidget(self.skip_duplicates_chk)
+
         toolbox = QToolBox()
         advanced = QWidget()
         adv_form = QFormLayout(advanced)
@@ -1266,6 +1282,7 @@ class NewScrapeScreen(QWidget):
             auto_qualify_leads=self.auto_qualify_chk.isChecked(),
             ai_extraction=self._collect_ai_extraction() or AIExtractionConfig(enabled=False),
             owner_lookup_enabled=self.owner_lookup_chk.isChecked(),
+            skip_duplicate_leads=self.skip_duplicates_chk.isChecked(),
         )
 
     def _collect_container(self) -> dict | None:
@@ -1435,7 +1452,13 @@ class NewScrapeScreen(QWidget):
         fmt, ok = self._ask_export_format()
         if not ok:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Export results", f"results.{fmt}", f"*.{fmt}")
+        # "odoo_xlsx" is still a real .xlsx file (Odoo's CRM Lead import
+        # layout, see exporter.export_odoo_xlsx) - only the internal
+        # EXPORTERS key has the odoo_ prefix, the file extension on disk
+        # must stay .xlsx or Excel/Odoo won't recognize it.
+        extension = "xlsx" if fmt == "odoo_xlsx" else fmt
+        default_name = "crm_leads.xlsx" if fmt == "odoo_xlsx" else f"results.{extension}"
+        path, _ = QFileDialog.getSaveFileName(self, "Export results", default_name, f"*.{extension}")
         if not path:
             return
         try:
@@ -1446,5 +1469,12 @@ class NewScrapeScreen(QWidget):
 
     def _ask_export_format(self) -> tuple[str, bool]:
         from PySide6.QtWidgets import QInputDialog
-        fmt, ok = QInputDialog.getItem(self, "Export format", "Choose a format:", ["csv", "json", "jsonl", "xlsx"], 0, False)
-        return fmt, ok
+        labels = {
+            "csv": "csv", "json": "json", "jsonl": "jsonl", "xlsx": "xlsx",
+            "odoo_xlsx": "Odoo CRM Lead template (.xlsx)",
+        }
+        label, ok = QInputDialog.getItem(self, "Export format", "Choose a format:", list(labels.values()), 0, False)
+        if not ok:
+            return "", False
+        reverse = {v: k for k, v in labels.items()}
+        return reverse[label], True
