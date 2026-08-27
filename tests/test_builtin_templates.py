@@ -13,6 +13,8 @@ from app.core.storage.db import Database
 from app.core.engine.builtin_templates import (
     BUILTIN_TEMPLATES, seed_builtin_templates, generate_niche_urls, generate_niche_urls_yelp,
     NICHE_SEARCH_TERMS, CITY_POOL, RESULTS_PER_PAGE, YELP_RESULTS_PER_PAGE, MAX_PAGES_PER_CITY,
+    resolve_cities, generate_niche_urls_all_sources, SOURCE_PROFILES, get_all_source_profiles,
+    generate_niche_urls_thumbtack,
 )
 
 
@@ -133,17 +135,22 @@ def test_generate_niche_urls_scales_with_target_count():
     assert len(big) > len(small)
 
 
-def test_generate_niche_urls_pages_within_a_city_before_moving_on():
-    urls = generate_niche_urls("Foundation Repair", RESULTS_PER_PAGE * 3)
-    # first MAX_PAGES_PER_CITY urls should all be the same (first) city,
-    # with an incrementing &page= for everything after the first
-    first_city, first_state = CITY_POOL[0]
-    for i, url in enumerate(urls[:3]):
-        assert quote_plus_city(first_city, first_state) in url
-        if i == 0:
-            assert "&page=" not in url
-        else:
-            assert f"&page={i + 1}" in url
+def test_generate_niche_urls_covers_cities_breadth_first_before_paging_deeper():
+    # Breadth-first across the city list (see generate_niche_urls()'s own
+    # docstring - "عايزة يسيرش التوب 100 مدينة"): every city's page 1
+    # comes before ANY city's page 2. Ask for enough to spill one page
+    # past the full pool, so urls[:len(CITY_POOL)] are all page 1 (across
+    # every distinct city) and only the ones after that start paging
+    # deeper.
+    urls = generate_niche_urls("Foundation Repair", RESULTS_PER_PAGE * (len(CITY_POOL) + 2))
+    assert len(urls) == len(CITY_POOL) + 2
+    page1_urls = urls[:len(CITY_POOL)]
+    assert all("&page=" not in u for u in page1_urls)
+    seen_cities = {quote_plus_city(city, state) for city, state in CITY_POOL}
+    assert all(any(c in u for c in seen_cities) for u in page1_urls)
+    # page 2 only starts after every city's page 1 has been queued
+    assert "&page=2" in urls[len(CITY_POOL)]
+    assert "&page=2" in urls[len(CITY_POOL) + 1]
 
 
 def quote_plus_city(city, state):
@@ -180,10 +187,15 @@ def test_generate_niche_urls_yelp_scales_with_target_count():
 
 
 def test_generate_niche_urls_yelp_uses_start_param_not_page():
-    urls = generate_niche_urls_yelp("Foundation Repair", YELP_RESULTS_PER_PAGE * 3)
-    assert "&start=" not in urls[0]
-    assert "&start=10" in urls[1]
-    assert "&start=20" in urls[2]
+    # Breadth-first across cities (same ordering as generate_niche_urls()
+    # above) - every city's &start=0 (no param) page comes before any
+    # city's &start=10 page, so spill one page past the full pool to see
+    # a real &start=10/&start=20.
+    urls = generate_niche_urls_yelp("Foundation Repair", YELP_RESULTS_PER_PAGE * (len(CITY_POOL) + 2))
+    assert len(urls) == len(CITY_POOL) + 2
+    assert all("&start=" not in u for u in urls[:len(CITY_POOL)])
+    assert "&start=10" in urls[len(CITY_POOL)]
+    assert "&start=10" in urls[len(CITY_POOL) + 1]
     assert all("yelp.com/search" in u for u in urls)
 
 
@@ -209,3 +221,135 @@ def test_yelp_detail_config_phone_regex_matches_real_yelp_markup():
     page_text = "Some business blurb\nGet Directions\n(972) 251-0018\nMon-Fri 8:00 am - 5:00 pm"
     m = re.search(pattern, page_text)
     assert m and m.group(0) == "(972) 251-0018"
+
+
+# --- city picker ("خليني اقدر احدد المدن اللي محتاجها") ---
+
+def test_resolve_cities_empty_input_means_use_full_pool():
+    assert resolve_cities("") == []
+    assert resolve_cities("   ") == []
+
+
+def test_resolve_cities_parses_city_state_pairs():
+    assert resolve_cities("Austin, TX") == [("Austin", "TX")]
+    assert resolve_cities("Austin, TX; Toronto, ON") == [("Austin", "TX"), ("Toronto", "ON")]
+    assert resolve_cities("Austin, TX\nToronto, ON\n") == [("Austin", "TX"), ("Toronto", "ON")]
+
+
+def test_resolve_cities_bare_city_with_no_state():
+    assert resolve_cities("Cairo") == [("Cairo", "")]
+
+
+def test_generate_niche_urls_restricts_to_given_cities():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    cities = [("Austin", "TX"), ("Denver", "CO")]
+    urls = generate_niche_urls(name, target_results=RESULTS_PER_PAGE * 20, cities=cities)
+    assert urls  # at least page 1 for each city
+    for u in urls:
+        assert ("Austin" in u) or ("Denver" in u)
+    assert not any("Chicago" in u for u in urls)  # a CITY_POOL city NOT in the restriction list
+
+
+def test_generate_niche_urls_yelp_restricts_to_given_cities():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    cities = [("Miami", "FL")]
+    urls = generate_niche_urls_yelp(name, target_results=YELP_RESULTS_PER_PAGE * 10, cities=cities)
+    assert urls
+    assert all("Miami" in u for u in urls)
+
+
+def test_generate_niche_urls_all_sources_restricts_to_given_cities():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    cities = [("Austin", "TX")]
+    urls = generate_niche_urls_all_sources(name, target_results=200, cities=cities)
+    assert urls
+    # case-insensitive: yellowpages/yelp keep "Austin" as typed (query-string
+    # encoded), thumbtack.com's URL shape lowercases every path segment
+    # (.../tx/austin/...) - see _thumbtack_slug().
+    assert all("austin" in u.lower() for u in urls)
+
+
+def test_generate_niche_urls_all_sources_includes_all_three_domains():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    urls = generate_niche_urls_all_sources(name, target_results=3000)
+    domains = {"yellowpages.com": False, "yelp.com": False, "thumbtack.com": False}
+    for u in urls:
+        for d in domains:
+            if d in u:
+                domains[d] = True
+    assert all(domains.values()), domains
+
+
+def test_generate_niche_urls_thumbtack_uses_real_url_pattern():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    urls = generate_niche_urls_thumbtack(name, target_results=50, cities=[("Austin", "TX")])
+    assert urls == [f"https://www.thumbtack.com/tx/austin/{NICHE_SEARCH_TERMS[name].replace(' ', '-')}/"]
+
+
+def test_generate_niche_urls_thumbtack_skips_cities_without_state():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    urls = generate_niche_urls_thumbtack(name, target_results=50, cities=[("Cairo", "")])
+    assert urls == []
+
+
+def test_generate_niche_urls_no_cities_arg_uses_full_pool_unchanged():
+    """Backward compatibility: omitting `cities` must behave exactly like
+    before this parameter existed (full CITY_POOL, same output)."""
+    name = next(iter(NICHE_SEARCH_TERMS))
+    assert generate_niche_urls(name, 500) == generate_niche_urls(name, 500, cities=None)
+
+
+# --- sources (built-in + user-added, "خليني اقدر من جوا اضيف مصادر جديدة") ---
+
+def test_source_profiles_includes_thumbtack_with_live_captured_selectors():
+    # Captured live via a real browser session (claude-in-chrome) on
+    # 2026-08-27 - see builtin_templates.py's docstring on
+    # _THUMBTACK_CONTAINER for exactly what was verified and why phone/
+    # website are deliberately absent (not a selector gap - Thumbtack
+    # never publicly renders either).
+    thumbtack = next(p for p in SOURCE_PROFILES if p["name"] == "thumbtack")
+    assert thumbtack["domain"] == "thumbtack.com"
+    assert thumbtack["verified"] is True
+    assert thumbtack["container"]["selector"] == "div.bb.b-gray-300.pv3.m_pv4"
+    field_names = {f.name for f in thumbtack["fields"]}
+    assert field_names == {"business_name", "rating", "thumbtack_profile_url"}
+    assert "phone" not in field_names
+    assert "website" not in field_names
+
+
+def test_get_all_source_profiles_includes_builtins_with_no_custom_sources():
+    with temp_db() as db:
+        names = {p["name"] for p in get_all_source_profiles(db)}
+        assert {"yellowpages", "yelp", "thumbtack"} <= names
+
+
+def test_get_all_source_profiles_includes_user_added_source():
+    with temp_db() as db:
+        db.create_custom_source(
+            "my_directory", "example-directory.com",
+            {"selector": ".listing", "type": "css"},
+            [{"name": "biz_name", "selector": ".name", "selector_type": "css",
+              "extraction_type": "text", "attribute": None, "multiple": False, "parent": None}],
+        )
+        profiles = get_all_source_profiles(db)
+        mine = next(p for p in profiles if p["name"] == "my_directory")
+        assert mine["domain"] == "example-directory.com"
+        assert mine["verified"] is False
+        assert mine["fields"][0].name == "biz_name"  # converted to ExtractionField, not a raw dict
+
+
+def test_get_all_source_profiles_custom_source_overrides_builtin_same_domain():
+    """A user filling in real thumbtack.com selectors must take priority
+    over the empty built-in stub - see get_all_source_profiles()'s
+    docstring on ordering."""
+    with temp_db() as db:
+        db.create_custom_source(
+            "thumbtack (fixed)", "thumbtack.com",
+            {"selector": ".real-card", "type": "css"},
+            [{"name": "business_name", "selector": ".real-name", "selector_type": "css",
+              "extraction_type": "text", "attribute": None, "multiple": False, "parent": None}],
+        )
+        profiles = get_all_source_profiles(db)
+        thumbtack_matches = [p for p in profiles if p["domain"] == "thumbtack.com"]
+        assert len(thumbtack_matches) == 1  # the empty built-in was superseded, not just appended
+        assert thumbtack_matches[0]["container"]["selector"] == ".real-card"

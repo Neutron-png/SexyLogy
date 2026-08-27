@@ -4,3 +4,13 @@ __pycache__/
 venv/
 .env
 *.log
+
+# Scrape/export output - these are DATA a user generates by running LOGY,
+# not part of the app itself, so they don't belong in version control
+# (also avoids repeatedly committing megabytes of scraped leads).
+*.xlsx
+*.csv
+*.jsonl
+results*.csv
+crm_leads*.xlsx
+logy.db

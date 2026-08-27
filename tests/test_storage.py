@@ -5,6 +5,7 @@ runner (this sandbox has no network access to install pytest - see
 tests/run_tests.py). If pytest is available in your environment, feel
 free to switch this back to a fixture.
 """
+import json
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -139,6 +140,37 @@ def test_lead_history_survives_project_deletion():
         db.record_lead_seen("fp-1", pid, job_id, {"email": "a@x.com"})
         db.delete_project(pid)
         assert db.lead_seen_before("fp-1") is not None
+
+
+def test_custom_sources_crud():
+    with temp_db() as db:
+        assert db.list_custom_sources() == []
+
+        source_id = db.create_custom_source(
+            "thumbtack", "thumbtack.com",
+            {"selector": ".card", "type": "css"},
+            [{"name": "business_name", "selector": ".name"}],
+            {"link_field": "profile_url", "fields": [], "regex_fields": {"phone": r"\d{3}-\d{4}"}},
+        )
+        rows = db.list_custom_sources()
+        assert len(rows) == 1
+        assert rows[0]["id"] == source_id
+        assert rows[0]["name"] == "thumbtack"
+        assert json.loads(rows[0]["container_json"])["selector"] == ".card"
+
+        db.update_custom_source(
+            source_id, "thumbtack (fixed)", "thumbtack.com",
+            {"selector": ".real-card", "type": "css"},
+            [{"name": "business_name", "selector": ".real-name"}],
+            None,
+        )
+        updated = db.list_custom_sources()[0]
+        assert updated["name"] == "thumbtack (fixed)"
+        assert json.loads(updated["container_json"])["selector"] == ".real-card"
+        assert updated["detail_config_json"] is None
+
+        db.delete_custom_source(source_id)
+        assert db.list_custom_sources() == []
 
 
 def test_db_usable_from_a_background_thread():

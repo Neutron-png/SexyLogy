@@ -101,8 +101,19 @@ def export_xlsx(results: Iterable[dict], dest: str | Path, on_progress: Progress
 ODOO_COLUMNS = [
     "External ID", "Name", "Company Name", "Contact Name", "Email",
     "Job Position", "Phone", "Mobile", "Street", "Street2", "City",
-    "State", "Zip", "Country", "Website", "Notes",
+    "State", "Zip", "Country", "Website", "Notes", "Channel",
 ]
+
+# "Channel" isn't part of Odoo's own stock crm.lead import template -
+# it's a REQUIRED field only on THIS user's own Odoo instance (a custom
+# field their install added, not something LOGY can know the valid
+# values for by guessing - "مينفعش أخمن قيمة غلط هتبوظ الامبورت"). Every
+# exported row gets the SAME fixed value from Settings -> "Odoo Export" ->
+# "Channel value" (see SettingsScreen / db setting "odoo_channel_value"),
+# defaulting to "Website" per the user's own answer, unless the scraped
+# data already has a field literally called "channel" (checked first, in
+# _lead_row_for_odoo() below, same as every other Odoo column).
+DEFAULT_ODOO_CHANNEL_VALUE = "Website"
 
 # One or more scraped-field names (case-insensitive) that map to each Odoo
 # column. Scraped field names come from whatever the user's own Field
@@ -124,10 +135,11 @@ _ODOO_FIELD_MAP: dict[str, tuple[str, ...]] = {
     "Country": ("country", "country_code"),
     "Website": ("website", "site", "url", "web", "homepage"),
     "Notes": ("notes", "description", "note", "comment", "comments"),
+    "Channel": ("channel", "lead_channel", "source_channel"),
 }
 
 
-def _lead_row_for_odoo(flat: dict, external_id: str) -> list:
+def _lead_row_for_odoo(flat: dict, external_id: str, channel_value: str = DEFAULT_ODOO_CHANNEL_VALUE) -> list:
     lower = {str(k).lower(): v for k, v in flat.items()}
     row = []
     for col in ODOO_COLUMNS:
@@ -139,6 +151,8 @@ def _lead_row_for_odoo(flat: dict, external_id: str) -> list:
             if key in lower and lower[key] not in (None, ""):
                 value = lower[key]
                 break
+        if col == "Channel" and value is None:
+            value = channel_value  # the lead itself has no "channel" field - fall back to the fixed setting
         row.append(_stringify(value) if value is not None else "")
     return row
 
@@ -183,12 +197,19 @@ _ODOO_IMPORT_FAQ = [
 ]
 
 
-def export_odoo_xlsx(results: Iterable[dict], dest: str | Path, on_progress: ProgressCB = None) -> int:
+def export_odoo_xlsx(
+    results: Iterable[dict], dest: str | Path, on_progress: ProgressCB = None,
+    channel_value: str = DEFAULT_ODOO_CHANNEL_VALUE,
+) -> int:
     """Exports in the same format/layout as Odoo's own CRM Lead import
     template (External ID / Name / Company Name / Contact Name / Email /
     Job Position / Phone / Mobile / Street / Street2 / City / State / Zip /
-    Country / Website / Notes, plus an 'Import FAQ' sheet) so the output can
-    be imported straight into Odoo's CRM -> Leads -> Import screen."""
+    Country / Website / Notes / Channel, plus an 'Import FAQ' sheet) so the
+    output can be imported straight into Odoo's CRM -> Leads -> Import
+    screen. `channel_value` fills the "Channel" column for every row that
+    has no scraped "channel" field of its own - see DEFAULT_ODOO_CHANNEL_VALUE
+    above and Settings -> "Odoo Export" for where a user changes it without
+    editing this file."""
     from openpyxl import Workbook
 
     dest = Path(dest)
@@ -200,7 +221,7 @@ def export_odoo_xlsx(results: Iterable[dict], dest: str | Path, on_progress: Pro
     ws.append(ODOO_COLUMNS)
     count = 0
     for i, row in enumerate(rows, start=1):
-        ws.append(_lead_row_for_odoo(row, f"crm_lead_{i}"))
+        ws.append(_lead_row_for_odoo(row, f"crm_lead_{i}", channel_value))
         count += 1
         if on_progress and count % 100 == 0:
             on_progress(count)
@@ -215,20 +236,86 @@ def export_odoo_xlsx(results: Iterable[dict], dest: str | Path, on_progress: Pro
     return count
 
 
+def export_odoo_xls(
+    results: Iterable[dict], dest: str | Path, on_progress: ProgressCB = None,
+    channel_value: str = DEFAULT_ODOO_CHANNEL_VALUE,
+) -> int:
+    """Same layout/columns as export_odoo_xlsx() above, but written as a
+    REAL legacy .xls (BIFF8 binary) file instead of .xlsx (OOXML) -
+    "عايزه يطلع XLS مش XSLS": Odoo's own downloadable CRM Lead import
+    template is itself a "crm_lead 1.xls" file (see this file's module
+    docstring / the very first file the user uploaded), and some Odoo
+    versions/import flows are pickier about accepting that exact legacy
+    format over .xlsx. openpyxl (used above) can only WRITE .xlsx - it
+    dropped .xls support entirely - so this uses xlwt instead, the
+    library that still writes genuine legacy Excel binary files. This is
+    NOT just export_odoo_xlsx()'s file renamed to '.xls' (that would be
+    an .xlsx file wearing the wrong extension, which real Excel/Odoo can
+    still detect and may reject or mis-parse) - the bytes on disk are an
+    actual .xls workbook.
+
+    xlwt is an old, no-longer-updated library (last released 2019) but
+    is still the correct tool for this: the legacy .xls format itself
+    hasn't changed, and no actively-maintained library replaced it for
+    WRITING (only reading, e.g. xlrd). Its one real limitation versus
+    openpyxl is a 65,536-row-per-sheet ceiling (the old Excel format's
+    own limit, not something LOGY imposes) - fine for the Odoo import use
+    case (Odoo's own bulk-import guidance recommends batches well under
+    that anyway), but worth knowing if this function is ever reused
+    elsewhere for very large exports."""
+    try:
+        import xlwt
+    except ImportError as e:
+        raise ImportError(
+            "تصدير Odoo بصيغة .xls محتاج مكتبة xlwt ومش متثبتة. افتح الطرفية وشغّل:\n\n"
+            "pip install xlwt\n\nوبعدين جرّب التصدير تاني."
+        ) from e
+
+    dest = Path(dest)
+    rows = list(_rows(results))
+
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet("Template")
+    for col_i, col_name in enumerate(ODOO_COLUMNS):
+        ws.write(0, col_i, col_name)
+    count = 0
+    for i, row in enumerate(rows, start=1):
+        values = _lead_row_for_odoo(row, f"crm_lead_{i}", channel_value)
+        for col_i, value in enumerate(values):
+            ws.write(i, col_i, value)
+        count += 1
+        if on_progress and count % 100 == 0:
+            on_progress(count)
+
+    faq = wb.add_sheet("Import FAQ")
+    for row_i, line in enumerate(_ODOO_IMPORT_FAQ):
+        faq.write(row_i, 0, line)
+
+    wb.save(str(dest))
+    if on_progress:
+        on_progress(count)
+    return count
+
+
 EXPORTERS = {
     "csv": export_csv,
     "json": export_json,
     "jsonl": export_jsonl,
     "xlsx": export_xlsx,
     "odoo_xlsx": export_odoo_xlsx,
+    "odoo_xls": export_odoo_xls,
 }
 
 
-def export(fmt: str, results: Iterable[dict], dest: str | Path, on_progress: ProgressCB = None) -> int:
+def export(fmt: str, results: Iterable[dict], dest: str | Path, on_progress: ProgressCB = None, **kwargs) -> int:
     fmt = fmt.lower().lstrip(".")
     if fmt not in EXPORTERS:
         raise ValueError(f"صيغة تصدير غير مدعومة: {fmt}. المتاح: {', '.join(EXPORTERS)}")
-    return EXPORTERS[fmt](results, dest, on_progress)
+    # **kwargs lets a caller pass exporter-specific options (currently
+    # only export_odoo_xlsx's channel_value - see new_scrape.py's
+    # _export_results()) without every OTHER exporter needing to accept
+    # and ignore them.
+    return EXPORTERS[fmt](results, dest, on_progress, **kwargs)
 
 
 def _collect_fieldnames(rows: list[dict]) -> list[str]:

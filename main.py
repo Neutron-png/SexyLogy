@@ -22,11 +22,26 @@ def _data_dir() -> Path:
 
 
 def main() -> int:
+    from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QIcon
     from app.ui.theme import QSS
     from app.ui.main_window import MainWindow
     from app.core.storage.db import Database
+
+    # "اظبط الريشيو بتاع الشاشات" - on a machine with more than one
+    # monitor at DIFFERENT DPI (a laptop's built-in 100% panel next to a
+    # 150%/200% external 4K display, or vice versa - very common on
+    # Windows), Qt has to pick ONE way to convert its logical layout
+    # pixels to each screen's real pixels. PassThrough tells it to use
+    # each screen's OWN scale factor exactly (instead of rounding every
+    # screen to the same whole-number factor, which is what previously
+    # made the window/UI look mis-sized - too small or too big, "wrong
+    # ratio" - the moment it was dragged onto a monitor with a different
+    # DPI than the one Qt started on). Must be set before QApplication()
+    # exists - Qt reads it once at construction.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv)
     app.setApplicationName("LOGY")

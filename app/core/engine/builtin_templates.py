@@ -15,7 +15,7 @@ manual selector work:
     for in Quick Start's "How many leads (approx.)" control (see
     generate_niche_urls() / generate_niche_urls_yelp() below)
 
-Two independent sources are wired up, each captured live from a real
+Three independent sources are wired up, each captured live from a real
 browser session reading the rendered DOM (document.querySelectorAll),
 never guessed from static/cached markup:
 
@@ -34,13 +34,25 @@ never guessed from static/cached markup:
   human-readable part of the name specifically to survive that (the hash
   suffix rotates, the "businessName"/"hoverable" prefix does not, per
   Yelp's own CSS-module naming convention), but they may still need
-  re-capturing sooner than the yellowpages ones.
+  re-capturing sooner than the yellowpages ones. Re-confirmed live on
+  2026-08-27 - still matching today, no re-capture needed yet.
 
-Captured live on 2026-08-19. Confirmed against real listings, e.g.
-"Athena Pools LLC" / (512) 914-0554 / athenapools.com (yellowpages, pool
-builders, Austin TX) and "Diaz Foundation Repair" / (yelp.com, foundation
-repair, Dallas TX, phone pulled from its own business page). Two sources
-were investigated and rejected: LinkedIn (explicitly out of scope - see
+  thumbtack.com - name + rating + a link back to its own profile page
+  only. This site never publicly renders a phone number or website at
+  all (it's a lead-request marketplace, not a directory - contact only
+  happens through its own gated "Message"/"Request a call" flow,
+  confirmed by opening a real pro's profile page live), so those two
+  fields are intentionally absent rather than guessed - see the
+  _THUMBTACK_CONTAINER docstring below for the full detail.
+
+Captured live on 2026-08-19 (yellowpages/Yelp) and 2026-08-27
+(thumbtack, plus a re-confirmation pass on yellowpages/Yelp). Confirmed
+against real listings, e.g. "Athena Pools LLC" / (512) 914-0554 /
+athenapools.com (yellowpages, pool builders, Austin TX), "Diaz
+Foundation Repair" (yelp.com, foundation repair, Dallas TX, phone pulled
+from its own business page), and "Dreemer Pool & Remodeling" / "Gold
+Standard Pool and Tile" (thumbtack.com, pool installation, Austin TX).
+Two other sources were investigated and rejected: LinkedIn (explicitly out of scope - see
 app/core/engine/ai_extractor.py's module docstring for the technical +
 legal/privacy reasoning, which still applies) and Google Search result
 pages (no reliable automated access without a real logged-in browser
@@ -56,6 +68,7 @@ template stops matching, re-capture selectors the same way (Inspect
 Element / a live DOM read on a real listing) and update the constants
 below.
 """
+import json
 from urllib.parse import quote
 
 from app.core.models import ExtractionField, ExtractionType
@@ -123,6 +136,177 @@ YELP_CONTAINER = _YELP_CONTAINER
 YELP_LEAD_FIELDS = _YELP_LEAD_FIELDS
 YELP_DETAIL_CONFIG = _YELP_DETAIL_CONFIG
 
+# ---------------------------------------------------------------------
+# thumbtack.com - captured live via a real Chrome browser session
+# (claude-in-chrome, not a raw HTTP fetch) on 2026-08-27, since
+# thumbtack.com's bot defenses block every direct WebFetch/curl-style
+# attempt from this environment (even its robots.txt request comes back
+# as a bot challenge, not the file) - a real rendered browser tab was
+# able to get past that where a raw fetch could not, letting the actual
+# DOM finally be read.
+#
+#   URL PATTERN: confirmed live for both categories checked
+#   (thumbtack.com/tx/austin/pool-installation,
+#   thumbtack.com/tx/austin/kitchen-remodeling - both real, working
+#   pages) - all follow the /<state-abbr>/<city-slug>/<niche-slug> shape
+#   built by _thumbtack_url()/generate_niche_urls_thumbtack() below, the
+#   same way _yp_search_url()/_yelp_search_url() do for their sites.
+#   IMPORTANT caveat found live: thumbtack's own category slugs don't
+#   always match yellowpages/Yelp's search terms exactly - e.g. "pool
+#   builders" 404s and thumbtack silently redirects to its real category
+#   "pool-installation" instead (still real content, just a slightly
+#   different category than the literal term), while a niche it has NO
+#   category for at all (tried: "car-dealership") returns a genuine 404
+#   page with zero matching containers, so extract_records() naturally
+#   returns zero records for it rather than fabricating anything - a
+#   handful of the 15 ICP niches (the medical/legal/dealership ones
+#   especially - Thumbtack is a home/personal-services marketplace, not
+#   a directory for those) may simply have no real Thumbtack category
+#   and will legitimately yield 0 thumbtack.com leads while yellowpages/
+#   Yelp still cover them normally. No confirmed pagination parameter
+#   exists for this page type (search results are titled "The 10 Best X
+#   in <City>" - a single top-10 list, not an obviously paginated one) -
+#   same first-page-only-per-city honesty disclosure as the Houzz note
+#   further down, not hidden as if it were equivalent to yellowpages'
+#   MAX_PAGES_PER_CITY-deep coverage.
+#
+#   SELECTORS: now genuinely captured live (verified against 10 real pro
+#   cards across the two category pages above):
+#     - container: `div.bb.b-gray-300.pv3.m_pv4` - one per listed pro.
+#       These are Tachyons-style utility classes (border-bottom + border
+#       color + padding), not a semantic "pro-card"-style name, so
+#       there's a real (if currently unobserved) chance of an unrelated
+#       page section reusing the exact same 4-class combo elsewhere -
+#       re-check this first if thumbtack results start coming back empty
+#       or wrong.
+#     - business_name: `.pro-title div.dib` - Thumbtack renders EVERY
+#       pro name TWICE inside `.pro-title` (a desktop-visible copy and a
+#       mobile-visible copy, both present in the raw HTML, CSS just
+#       toggles which one shows) - selecting `.pro-title` alone
+#       concatenates both copies into one doubled string
+#       ("NameNameHere"). `div.dib` (Tachyons "display:inline-block",
+#       present ONLY on the desktop copy) picks out just one of the two.
+#     - rating: `.pro-ratings` - e.g. "Exceptional 5.0(21)" (rating word
+#       + score + review count together as one string, comma-free so it
+#       won't collide with CSV export - there's no separate stable hook
+#       to split the score from the review count, so this ships as one
+#       combined field rather than a fragile guess at splitting it).
+#       Not a "lead" field on its own but useful qualification context.
+#     - thumbtack_profile_url: `a` (the single link wrapping the whole
+#       card), extraction_type=ATTRIBUTE/href - a RELATIVE path into
+#       thumbtack.com itself (e.g.
+#       "/tx/austin/swimming-pool-maintenance/some-pro/service/12345"),
+#       not an external site - Thumbtack is a lead-marketplace, not a
+#       directory of external listings.
+#     - phone / website: DELIBERATELY NOT INCLUDED, and this is not a
+#       "selectors still missing" gap the way it was before - a real
+#       Thumbtack pro profile page was opened live (Dreemer Pool &
+#       Remodeling's) and neither a phone number nor an external website
+#       link appears ANYWHERE on it, public or otherwise: contact only
+#       happens through Thumbtack's own gated "Message" / "Request a
+#       call" flow. No CSS selector, however well captured, can extract
+#       data that was never rendered on the page - shipping empty phone/
+#       website fields "waiting to be filled in" here would misrepresent
+#       a structural fact about the site as an unfinished selector.
+#   "verified": True on its SOURCE_PROFILES entry below reflects this -
+#   the selectors themselves are now real and confirmed, same standing
+#   as yellowpages/Yelp, just for a narrower field set than either.
+# ---------------------------------------------------------------------
+_THUMBTACK_CONTAINER = {"selector": "div.bb.b-gray-300.pv3.m_pv4", "type": "css"}
+_THUMBTACK_LEAD_FIELDS = [
+    ExtractionField(name="business_name", selector=".pro-title div.dib"),
+    ExtractionField(name="rating", selector=".pro-ratings"),
+    ExtractionField(
+        name="thumbtack_profile_url", selector="a",
+        extraction_type=ExtractionType.ATTRIBUTE, attribute="href",
+    ),
+]
+THUMBTACK_CONTAINER = _THUMBTACK_CONTAINER
+THUMBTACK_LEAD_FIELDS = _THUMBTACK_LEAD_FIELDS
+
+THUMBTACK_RESULTS_PER_PAGE = 10  # "The 10 Best X in <City>" - thumbtack's own page title pattern
+
+
+def _thumbtack_slug(text: str) -> str:
+    """'Pool Builders' -> 'pool-builders', matching the real slug shape
+    seen in live thumbtack.com URLs (thumbtack.com/tx/austin/pool-builders,
+    thumbtack.com/tx/san-antonio/pool-builders - confirmed via search,
+    not fetched directly, see the module note above)."""
+    slug = text.strip().lower().replace("/", "-")
+    slug = "".join(c for c in slug if c.isalnum() or c in " -")
+    return "-".join(slug.split())
+
+
+def _thumbtack_url(term: str, city: str, state: str) -> str | None:
+    """Builds a thumbtack.com city+niche page URL, or None if `state` is
+    blank - thumbtack's URL shape requires a state abbreviation
+    (/<state>/<city>/<niche>/), unlike yellowpages/yelp's query-string
+    search which still works with just a city name."""
+    if not state:
+        return None
+    return f"https://www.thumbtack.com/{_thumbtack_slug(state)}/{_thumbtack_slug(city)}/{_thumbtack_slug(term)}/"
+
+
+def generate_niche_urls_thumbtack(
+    niche_name: str, target_results: int, max_urls: int | None = None,
+    cities: list[tuple[str, str]] | None = None,
+) -> list[str]:
+    """One thumbtack.com city+niche page per city (~THUMBTACK_RESULTS_PER_PAGE
+    leads each - no confirmed pagination for this page type, see the
+    module note above), breadth across the city list the same way
+    generate_niche_urls()/_yelp() do. Cities with no state abbreviation
+    are skipped (see _thumbtack_url()) rather than producing a broken
+    URL. `cities`/`target_results`/`max_urls` behave the same as the
+    other two generators. max_urls defaults to MAX_URLS_ALL_CITIES,
+    resolved lazily here (not as the parameter default) since that
+    constant is defined further down this module, after this function."""
+    if max_urls is None:
+        max_urls = MAX_URLS_ALL_CITIES
+    term = NICHE_SEARCH_TERMS.get(niche_name)
+    if not term:
+        return []
+    pool = cities if cities else CITY_POOL
+    urls_needed = min(max(1, -(-target_results // THUMBTACK_RESULTS_PER_PAGE)), max_urls)
+    urls: list[str] = []
+    for city, state in pool:
+        url = _thumbtack_url(term, city, state)
+        if url is None:
+            continue
+        urls.append(url)
+        if len(urls) >= urls_needed:
+            return urls
+    return urls
+
+
+def resolve_cities(text: str) -> list[tuple[str, str]]:
+    """Parses a user-typed city list (one per line, or separated by ';')
+    into (city, state) pairs for generate_niche_urls()/_yelp()/
+    _all_sources() below - the "خليني اقدر احدد المدن اللي محتاجها" city
+    picker in New Scrape's Quick Start card. Each entry's LAST comma
+    splits city from state/province - "New York, NY" -> ("New York",
+    "NY"); an entry with no comma is kept as (entry, "") so a bare city
+    name still builds a working search URL (yellowpages/yelp's own geo
+    search just degrades to a wider match without a state, it doesn't
+    error). Not limited to CITY_POOL - any city text the user types is
+    used as-is, so this also covers cities/regions LOGY doesn't ship in
+    its own top-100 list.
+
+    Blank/whitespace-only input returns [] - the caller's cue to fall
+    back to the full CITY_POOL ("leave empty for all top cities")."""
+    if not text or not text.strip():
+        return []
+    entries: list[tuple[str, str]] = []
+    for line in text.replace(";", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if "," in line:
+            city, state = line.rsplit(",", 1)
+            entries.append((city.strip(), state.strip()))
+        else:
+            entries.append((line, ""))
+    return entries
+
 # name -> (ideal monthly fee range, search term). The search term is
 # reused for both yellowpages (search_terms=) and yelp (find_desc=) -
 # both accept the same plain-English phrase.
@@ -187,13 +371,34 @@ CITY_POOL: list[tuple[str, str]] = [
 RESULTS_PER_PAGE = 30       # yellowpages.com's own page size, confirmed live
 YELP_RESULTS_PER_PAGE = 10  # yelp.com's own page size, confirmed live
 
-# Requesting more than this many pages for one city started returning
-# stale/repeated results in a live check on yellowpages (page 7 of a
-# 165-result, ~6-page search still returned 26 rows instead of running
-# out) - past this point LOGY spreads across more cities instead of
-# paging one city further, to avoid burning fetches on likely-duplicate
-# rows. Applied to both sources for consistency.
-MAX_PAGES_PER_CITY = 5
+# "عايزة يطلع لكل مدينة على الاقل 3000 ليد او على الاقل يبقى عندها
+# المقدرة لكدا" - the user wants the CAPABILITY to page a single city
+# this deep, not to be capped at a handful of pages before LOGY moves on
+# to the next city. ceil(3000 / RESULTS_PER_PAGE) = 100 pages covers that
+# for yellowpages.com (30/page); ceil(3000 / YELP_RESULTS_PER_PAGE) = 300
+# covers the same target for Yelp (10/page) - 300 is the shared value so
+# neither source falls short of it.
+#
+# This was previously capped at 5: a live check found that requesting
+# more pages than a search actually had for one city+niche
+# (yellowpages: page 7 of a 165-result, ~6-page search still returned 26
+# rows instead of running out) returned STALE/REPEATED results past the
+# real end of that list. That risk hasn't gone away - most real
+# city+niche combinations on any of these 3 free directories have nowhere
+# near 3000 distinct businesses, so a run this deep WILL spend most of
+# its fetches re-reading the same tail-end rows once the real listings
+# run out. What changed is that this project's lead-history de-dup layer
+# (see app/core/storage/db.py's lead_history table +
+# ScrapeOptions.skip_duplicate_leads, wired into job_manager.py) now
+# exists specifically to make that safe: a re-fetched duplicate lead is
+# recognized and skipped rather than saved twice, so paging this deep no
+# longer risks a result file full of repeats - the cost is only extra
+# fetch time, not bad data. 3000 leads for ONE city+niche pair is still
+# not a promise LOGY can make (it depends entirely on how many real
+# businesses that directory actually lists there), only a depth ceiling
+# LOGY will now page all the way down to if that many real, distinct
+# results exist. Applied to both sources for consistency.
+MAX_PAGES_PER_CITY = 300
 
 # "عايزة يسيرش التوب 100 مدينة" - full CITY_POOL coverage at
 # MAX_PAGES_PER_CITY depth each is the real ceiling of what LOGY can
@@ -226,22 +431,33 @@ def _niche_start_urls(term: str, cities: list[tuple[str, str]]) -> list[str]:
     return [_yp_search_url(term, city, state) for city, state in cities]
 
 
-def generate_niche_urls(niche_name: str, target_results: int, max_urls: int = MAX_URLS_ALL_CITIES) -> list[str]:
+def generate_niche_urls(
+    niche_name: str, target_results: int, max_urls: int = MAX_URLS_ALL_CITIES,
+    cities: list[tuple[str, str]] | None = None,
+) -> list[str]:
     """
     Build enough yellowpages.com search-result-page URLs to cover
     approximately `target_results` leads for the given niche (bare name,
     e.g. "Foundation Repair" - matches the keys in NICHE_SEARCH_TERMS).
 
-    Iterates BREADTH-FIRST across CITY_POOL: every city's page 1 comes
-    before ANY city's page 2, page 2 across every city before page 3,
-    and so on, up to MAX_PAGES_PER_CITY. This is a fix for "عايزة يسيرش
-    التوب 100 مدينة" (search across the top 100 cities) - the previous
-    DEPTH-first order (page through all MAX_PAGES_PER_CITY pages of city
-    1, then city 2, ...) meant a moderate lead-count target got fully
-    absorbed by the first 2-3 cities in CITY_POOL and never reached most
-    of it; asking for the same number of leads now spreads across far
-    more cities first, and only pages deeper into cities already covered
-    once every city has at least one page queued.
+    Iterates BREADTH-FIRST across the city list: every city's page 1
+    comes before ANY city's page 2, page 2 across every city before page
+    3, and so on, up to MAX_PAGES_PER_CITY. This is a fix for "عايزة
+    يسيرش التوب 100 مدينة" (search across the top 100 cities) - the
+    previous DEPTH-first order (page through all MAX_PAGES_PER_CITY
+    pages of city 1, then city 2, ...) meant a moderate lead-count
+    target got fully absorbed by the first 2-3 cities and never reached
+    most of it; asking for the same number of leads now spreads across
+    far more cities first, and only pages deeper into cities already
+    covered once every city has at least one page queued.
+
+    `cities`: optional (city, state) pairs to restrict the search to -
+    "خليني اقدر احدد المدن اللي محتاجها". None/omitted uses the full
+    CITY_POOL (the previous, only, behavior); see resolve_cities() above
+    for turning a user-typed city list into this shape. Passing a
+    smaller list means fewer real businesses exist to find, so the
+    result naturally tops out well below `target_results` - that's
+    expected, not a bug (see the note below).
 
     "target_results" is a target to page toward, not a guarantee - the
     real ceiling is however many businesses actually exist in
@@ -250,33 +466,39 @@ def generate_niche_urls(niche_name: str, target_results: int, max_urls: int = MA
     term = NICHE_SEARCH_TERMS.get(niche_name)
     if not term:
         return []
+    pool = cities if cities else CITY_POOL
     urls_needed = min(max(1, -(-target_results // RESULTS_PER_PAGE)), max_urls)  # ceil division
     urls: list[str] = []
     for page in range(1, MAX_PAGES_PER_CITY + 1):
-        for city, state in CITY_POOL:
+        for city, state in pool:
             urls.append(_yp_search_url(term, city, state, page))
             if len(urls) >= urls_needed:
                 return urls
     return urls  # exhausted the whole city pool before reaching urls_needed
 
 
-def generate_niche_urls_yelp(niche_name: str, target_results: int, max_urls: int = MAX_URLS_ALL_CITIES) -> list[str]:
+def generate_niche_urls_yelp(
+    niche_name: str, target_results: int, max_urls: int = MAX_URLS_ALL_CITIES,
+    cities: list[tuple[str, str]] | None = None,
+) -> list[str]:
     """Same idea as generate_niche_urls() but for yelp.com (10 results
     per page via &start=10,20,...  instead of yellowpages' &page=2,3...),
-    and the same breadth-first-across-CITY_POOL ordering (see that
+    and the same breadth-first-across-city-list ordering (see that
     function's docstring) - every city's first page before any city's
-    second page. Each URL here costs LOGY a SECOND fetch per lead found
-    on it (see _YELP_DETAIL_CONFIG) to get the phone number, so a
-    Yelp-sourced run is slower than the equivalent yellowpages one for
-    the same lead count - that trade-off is what the user asked for
+    second page. `cities` works the same way as generate_niche_urls()'s
+    (None = full CITY_POOL). Each URL here costs LOGY a SECOND fetch per
+    lead found on it (see _YELP_DETAIL_CONFIG) to get the phone number,
+    so a Yelp-sourced run is slower than the equivalent yellowpages one
+    for the same lead count - that trade-off is what the user asked for
     (full phone numbers over raw speed)."""
     term = NICHE_SEARCH_TERMS.get(niche_name)
     if not term:
         return []
+    pool = cities if cities else CITY_POOL
     urls_needed = min(max(1, -(-target_results // YELP_RESULTS_PER_PAGE)), max_urls)
     urls: list[str] = []
     for page_i in range(MAX_PAGES_PER_CITY):
-        for city, state in CITY_POOL:
+        for city, state in pool:
             urls.append(_yelp_search_url(term, city, state, start=page_i * YELP_RESULTS_PER_PAGE))
             if len(urls) >= urls_needed:
                 return urls
@@ -300,28 +522,89 @@ def generate_niche_urls_yelp(niche_name: str, target_results: int, max_urls: int
 # picks it up with no other code changes.
 SOURCE_PROFILES: list[dict] = [
     {"name": "yellowpages", "domain": "yellowpages.com", "container": _YP_CONTAINER,
-     "fields": _YP_LEAD_FIELDS, "detail_config": None},
+     "fields": _YP_LEAD_FIELDS, "detail_config": None, "verified": True},
     {"name": "yelp", "domain": "yelp.com", "container": _YELP_CONTAINER,
-     "fields": _YELP_LEAD_FIELDS, "detail_config": _YELP_DETAIL_CONFIG},
+     "fields": _YELP_LEAD_FIELDS, "detail_config": _YELP_DETAIL_CONFIG, "verified": True},
+    {"name": "thumbtack", "domain": "thumbtack.com", "container": _THUMBTACK_CONTAINER,
+     "fields": _THUMBTACK_LEAD_FIELDS, "detail_config": None, "verified": True},
 ]
 
 
-def generate_niche_urls_all_sources(niche_name: str, target_results: int, max_urls: int = MAX_URLS_ALL_CITIES * 2) -> list[str]:
-    """Combined yellowpages.com + Yelp URL list for one niche, sized so
-    the two sources split target_results roughly evenly between them (a
-    yellowpages page is worth RESULTS_PER_PAGE leads, a Yelp page only
-    YELP_RESULTS_PER_PAGE - each generator already accounts for its own
-    page size, so this just calls both with half the target and
-    concatenates). The result mixes both domains in one flat list -
-    that's the point (see SOURCE_PROFILES above): a single job whose
-    start_urls list is exactly this can extract every URL correctly in
-    one run instead of needing two separate runs merged by hand
-    afterward."""
-    half = max(1, target_results // 2)
-    yp_max = max(1, max_urls // 2)
-    yp_urls = generate_niche_urls(niche_name, half, max_urls=yp_max)
-    yelp_urls = generate_niche_urls_yelp(niche_name, half, max_urls=max(1, max_urls - len(yp_urls)))
-    return yp_urls + yelp_urls
+def get_all_source_profiles(db) -> list[dict]:
+    """SOURCE_PROFILES (built-in: yellowpages, yelp, thumbtack) PLUS any
+    source the user added from inside the app - "خليني اقدر من جوا اضيف
+    مصادر جديدة": New Scrape's Sources card -> "+ Add Source", persisted
+    via Database.create_custom_source()/list_custom_sources(). Together
+    this is the single list "Load All Sources (combined)" and Quick
+    Start's "All Sources" niche option should iterate, so a user-added
+    source participates in a combined run exactly like the built-in ones
+    do - see job_manager.ScrapeJobWorker._resolve_source(), which picks
+    a fetched URL's selectors by matching its domain against this same
+    list. Custom rows are converted from their stored JSON shape into
+    SOURCE_PROFILES' own dict shape, with "fields" turned back into
+    ExtractionField objects (not raw dicts) since that's what the
+    extractor consumes - see job_manager.py.
+
+    Custom sources are listed BEFORE the built-ins, and _resolve_source()
+    in job_manager.py returns on the FIRST domain match - so a
+    user-added source for the same domain as a built-in (e.g. filling in
+    real selectors for "thumbtack.com", which ships with empty ones -
+    see _THUMBTACK_CONTAINER above) correctly WINS over the empty
+    built-in stub instead of that stub always matching first."""
+    custom_profiles = []
+    for row in db.list_custom_sources():
+        detail_json = row.get("detail_config_json")
+        custom_profiles.append({
+            "name": row["name"],
+            "domain": row["domain"],
+            "container": json.loads(row["container_json"]),
+            "fields": [ExtractionField.from_dict(f) for f in json.loads(row["fields_json"])],
+            "detail_config": json.loads(detail_json) if detail_json else None,
+            "verified": False,  # user-added - not captured/confirmed the way built-ins are
+        })
+    custom_domains = {p["domain"] for p in custom_profiles}
+    builtins = [p for p in SOURCE_PROFILES if p["domain"] not in custom_domains]
+    return custom_profiles + builtins
+
+
+def generate_niche_urls_all_sources(
+    niche_name: str, target_results: int, max_urls: int = MAX_URLS_ALL_CITIES * 2,
+    cities: list[tuple[str, str]] | None = None,
+) -> list[str]:
+    """Combined yellowpages.com + Yelp + thumbtack.com URL list for one
+    niche, sized so the three sources split target_results roughly
+    evenly between them (each generator already accounts for its own
+    page size - RESULTS_PER_PAGE / YELP_RESULTS_PER_PAGE /
+    THUMBTACK_RESULTS_PER_PAGE - so this just calls all three with a
+    third of the target and concatenates). The result mixes all three
+    domains in one flat list - that's the point (see SOURCE_PROFILES
+    above): a single job whose start_urls list is exactly this can
+    extract every URL correctly in one run instead of needing three
+    separate runs merged by hand afterward. This is what Quick Start's
+    per-niche picker calls automatically now (no more separate
+    "yellowpages-only" / "Yelp-only" / "All Sources" choices to make per
+    niche - see new_scrape.py's niche_combo). `cities` (see
+    resolve_cities()) is forwarded unchanged to every sub-call so a city
+    restriction applies to all three sources at once. thumbtack's own
+    selectors are still unverified (see the module note above on
+    _THUMBTACK_CONTAINER) - its URLs are included here for when they're
+    filled in, but until then its pages will fetch fine and simply
+    extract 0 records, same as any source with an empty container.
+    A source added via the Sources card (other than the three built-ins)
+    doesn't have a per-niche URL generator of its own - it only ever
+    comes into a combined run via its own start_urls the user pastes in,
+    since URL PATTERNS differ per site in a way generate_niche_urls()
+    can't guess for an arbitrary new domain."""
+    third = max(1, target_results // 3)
+    yp_max = max(1, max_urls // 3)
+    yp_urls = generate_niche_urls(niche_name, third, max_urls=yp_max, cities=cities)
+    remaining = max(1, max_urls - len(yp_urls))
+    yelp_max = max(1, remaining // 2)
+    yelp_urls = generate_niche_urls_yelp(niche_name, third, max_urls=yelp_max, cities=cities)
+    thumbtack_urls = generate_niche_urls_thumbtack(
+        niche_name, third, max_urls=max(1, max_urls - len(yp_urls) - len(yelp_urls)), cities=cities,
+    )
+    return yp_urls + yelp_urls + thumbtack_urls
 
 
 BUILTIN_TEMPLATES: list[dict] = [

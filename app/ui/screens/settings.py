@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 
 from app.core.storage.db import Database
 from app.core.engine import scrapling_adapter as engine
+from app.core.exports.exporter import DEFAULT_ODOO_CHANNEL_VALUE
 
 
 class SettingsScreen(QWidget):
@@ -27,6 +28,7 @@ class SettingsScreen(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self._general_tab(), "General")
         tabs.addTab(self._scraping_tab(), "Scraping")
+        tabs.addTab(self._odoo_export_tab(), "Odoo Export")
         tabs.addTab(self._browser_tab(), "Browser")
         tabs.addTab(self._storage_tab(), "Storage")
         tabs.addTab(self._advanced_tab(), "Advanced")
@@ -84,6 +86,35 @@ class SettingsScreen(QWidget):
         form.addRow("Default timeout (s)", timeout)
         form.addRow("Default concurrency", concurrency)
         form.addRow("Default delay (ms)", delay)
+        return w
+
+    def _odoo_export_tab(self) -> QWidget:
+        # "Channel" is a required field only on THIS user's own Odoo
+        # instance, not part of Odoo's stock crm.lead import template -
+        # LOGY has no way to know what values it accepts (it's a custom
+        # field), so it's a single value the user types once here instead
+        # of a guess baked into the exporter (see exporter.py's
+        # DEFAULT_ODOO_CHANNEL_VALUE / _lead_row_for_odoo()). Applied to
+        # EVERY lead in an "Odoo CRM Lead template (.xlsx)" export unless
+        # that lead's own scraped data already has a "channel" field.
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        note = QLabel(
+            "لو ملف الأودو بتاعك محتاج قيمة إجبارية لحقل 'Channel' مش موجودة في بيانات الليدز نفسها "
+            "(زي 'Missing required value for the field Channel')، حط هنا القيمة اللي هتتحط تلقائي لكل "
+            "ليد بيتصدّر بصيغة 'Odoo CRM Lead template' - لازم تكون مكتوبة بالظبط زي ما هي موجودة "
+            "عندك في أودو (مثلاً اسم قناة من قايمة الـ Channels بتاعتك)."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #8B95A7; font-size: 11px;")
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        channel_value = QLineEdit(self.db.get_setting("odoo_channel_value", DEFAULT_ODOO_CHANNEL_VALUE))
+        channel_value.textChanged.connect(lambda v: self.db.set_setting("odoo_channel_value", v))
+        form.addRow("Channel value", channel_value)
+        layout.addLayout(form)
+        layout.addStretch(1)
         return w
 
     def _browser_tab(self) -> QWidget:

@@ -141,3 +141,49 @@ def test_text_field_returns_clean_text_not_raw_html_for_nested_markup():
     assert record["phone"] == "(469) 983-5146"
     assert "<" not in record["phone"]
     assert record["street"] == "381 Casa Linda Plz"
+
+
+# thumbtack.com renders every pro's name TWICE inside one wrapper - a
+# desktop-visible copy and a mobile-visible copy, both present in the raw
+# HTML with CSS just toggling which one shows (confirmed live via a real
+# browser session on 2026-08-27 - see builtin_templates.py's
+# _THUMBTACK_CONTAINER docstring). A selector on the shared wrapper alone
+# (".pro-title") would concatenate BOTH copies' text into one doubled
+# string - this is a regression test for the ".pro-title div.dib" fix
+# that picks out only the desktop copy.
+THUMBTACK_CARD_HTML = """
+<html><body>
+<div class="bb b-gray-300 pv3 m_pv4">
+  <a href="/tx/austin/swimming-pool-maintenance/dreemer-pool-remodeling/service/554309614018969613">
+    <div class="pro-title mr1 black hover-blue">
+      <span class="dib m_dn tp-body-2 pre"></span>
+      <div class="Type_title7__9t_vN dib s_dn">Dreemer Pool &amp; Remodeling</div>
+      <span class="dn s_dib tp-body-1 pre"></span>
+      <div class="Type_title6__pMyYO dn s_dib">Dreemer Pool &amp; Remodeling</div>
+    </div>
+    <div class="pro-ratings flex items-center">
+      <p class="Type_text1__634gq">Exceptional 5.0</p>
+      <p class="Type_text2__2_pIm flex items-center black-300">(21)</p>
+    </div>
+  </a>
+</div>
+</body></html>
+"""
+
+
+def test_thumbtack_business_name_selector_avoids_duplicate_responsive_copy():
+    page = FakeSelector(THUMBTACK_CARD_HTML)
+    fields = [
+        ExtractionField(name="business_name", selector=".pro-title div.dib"),
+        ExtractionField(name="rating", selector=".pro-ratings"),
+        ExtractionField(
+            name="thumbtack_profile_url", selector="a",
+            extraction_type=ExtractionType.ATTRIBUTE, attribute="href",
+        ),
+    ]
+    records = extract_records(page, "div.bb.b-gray-300.pv3.m_pv4", "css", fields)
+    assert len(records) == 1
+    assert records[0]["business_name"] == "Dreemer Pool & Remodeling"
+    assert "RemodelingDreemer" not in records[0]["business_name"]  # the doubled-text bug this guards against
+    assert records[0]["rating"] == "Exceptional 5.0 (21)"
+    assert records[0]["thumbtack_profile_url"].startswith("/tx/austin/")

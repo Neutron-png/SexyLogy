@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
     QLineEdit, QTabWidget, QComboBox, QSpinBox, QCheckBox, QFormLayout,
     QScrollArea, QMessageBox, QFileDialog, QProgressBar, QSplitter, QToolBox,
-    QTableView, QAbstractItemView,
+    QTableView, QAbstractItemView, QListWidget, QListWidgetItem,
 )
 
 from app.core.models import (
@@ -19,12 +19,15 @@ from app.core.engine import scrapling_adapter as engine
 from app.core.engine.builtin_templates import (
     generate_niche_urls, generate_niche_urls_yelp, generate_niche_urls_all_sources,
     RESULTS_PER_PAGE, YELP_RESULTS_PER_PAGE, YELP_CONTAINER, YELP_DETAIL_CONFIG,
-    SOURCE_PROFILES, ICP_NICHES, CITY_POOL, MAX_URLS_ALL_CITIES,
+    ICP_NICHES, CITY_POOL, MAX_URLS_ALL_CITIES,
+    get_all_source_profiles,
 )
 from app.core.exports import exporter
 from app.core.job_manager import JobManager
 from app.core.storage.db import Database
 from app.utils.validation import parse_url_list, validate_json_schema
+from app.ui.dialogs.source_dialog import SourceDialog
+from app.ui.dialogs.city_picker_dialog import CityPickerDialog
 from app.ui.widgets.field_builder import FieldBuilder
 from app.ui.widgets.log_panel import LogPanel
 from app.ui.widgets.results_table import ResultsTableModel
@@ -65,6 +68,11 @@ class NewScrapeScreen(QWidget):
         # selector set for every URL in the job - see
         # ScrapeJobWorker._resolve_source().
         self._active_source_profiles: list[dict] | None = None
+        # Cities to restrict every generated search URL to - "خليني اقدر
+        # احدد المدن اللي محتاجها". Defaults to the full CITY_POOL (every
+        # box checked in the picker) - the previous, only, behavior.
+        # Changed via _open_city_picker() below; read by _collect_cities().
+        self._selected_cities: list[tuple[str, str]] = list(CITY_POOL)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
@@ -109,6 +117,7 @@ class NewScrapeScreen(QWidget):
         scroll.setWidget(config_widget)
 
         config_layout.addWidget(self._build_quick_start_section())
+        config_layout.addWidget(self._build_sources_section())
         config_layout.addWidget(self._build_target_section())
         config_layout.addWidget(self._build_extraction_section())
 
@@ -162,37 +171,18 @@ class NewScrapeScreen(QWidget):
         row = QHBoxLayout()
         self.niche_combo = QComboBox()
         self.niche_combo.addItem("Choose a niche...", None)
-        # Three entries per niche now: yellowpages-only, Yelp-only (adds a
-        # phone-enrichment 2nd fetch), and "All Sources" - which combines
-        # both sources' URLs into ONE job (see "عايز كل اللينكات الممكنة
-        # في وقت واحد مش يمشي عليها واحد واحد" - the user explicitly
-        # doesn't want to run sources one at a time and merge results by
-        # hand). Built from ICP_NICHES (fixed niche order) + a lookup of
-        # each niche's two template ids, rather than iterating
-        # db.list_templates() directly, so the three entries for a niche
-        # always appear grouped together regardless of DB row order.
-        templates_by_key: dict[tuple[str, str], int] = {}
-        for t in self.db.list_templates():
-            config = json.loads(t["config_json"])
-            if not config.get("icp"):
-                continue
-            if t["name"].startswith("SEO Leads (Yelp) - "):
-                templates_by_key[(t["name"][len("SEO Leads (Yelp) - "):], "yelp")] = t["id"]
-            elif t["name"].startswith("SEO Leads - "):
-                templates_by_key[(t["name"][len("SEO Leads - "):], "yellowpages")] = t["id"]
+        # ONE entry per niche now - "شيل ان يبقى فيه 3 اوبشن لكل نيش ...
+        # من غير ما تقول في الاسم ان هو كذا + كذا + كذا": the user
+        # explicitly does not want to choose yellowpages-only vs Yelp-only
+        # vs "All Sources" per niche, and does not want the combo label to
+        # spell out which sources are combined. Every niche pick now
+        # always combines all 3 sources (yellowpages + Yelp + thumbtack -
+        # see generate_niche_urls_all_sources() in builtin_templates.py)
+        # automatically - the combo's data is just the bare niche name
+        # string, consumed directly by _apply_niche_template() below.
         for niche, fee, _term in ICP_NICHES:
             fee_tag = f"  ({fee})" if fee else ""
-            yp_id = templates_by_key.get((niche, "yellowpages"))
-            yelp_id = templates_by_key.get((niche, "yelp"))
-            if yp_id is not None:
-                self.niche_combo.addItem(f"{niche}{fee_tag}", yp_id)
-            if yelp_id is not None:
-                self.niche_combo.addItem(f"{niche}{fee_tag}  — Yelp (adds phone via 2nd fetch)", yelp_id)
-            if yp_id is not None and yelp_id is not None:
-                self.niche_combo.addItem(
-                    f"{niche}{fee_tag}  — All Sources (yellowpages + Yelp combined)",
-                    ("all_sources", niche),
-                )
+            self.niche_combo.addItem(f"{niche}{fee_tag}", niche)
         apply_btn = QPushButton("Use this niche")
         apply_btn.setObjectName("primaryButton")
         apply_btn.clicked.connect(self._apply_niche_template)
@@ -227,6 +217,35 @@ class NewScrapeScreen(QWidget):
         # try.
         self.target_results_spin.setValue(6000)
         target_row.addWidget(self.target_results_spin)
+
+        # "خليني اقدر احدد المدن اللي محتاجها و بالتالي دا ينطبق على
+        # اللينكات اللي هتطلع برضة تبقى مخصصة للمدينة دي بس" + "المدن تبقى
+        # في سلايدر فيه كل المدن اللي بنشتغل عليها + سيرش بار فيها" -
+        # restrict every generated URL (any source, niche picked from Quick
+        # Start or from the buttons in the Target section below) to ONLY
+        # the cities checked in the "Choose Cities..." picker dialog (see
+        # app/ui/dialogs/city_picker_dialog.py - a checkable, live-
+        # searchable list of the full CITY_POOL, opened via
+        # _open_city_picker() below), instead of always spreading across
+        # the full top-100 CITY_POOL. self._selected_cities (set in
+        # __init__) holds the current pick; _collect_cities() below is
+        # what every URL-generating call site in this file goes through.
+        cities_row = QHBoxLayout()
+        cities_row.addWidget(QLabel("Cities:"))
+        choose_cities_btn = QPushButton("Choose Cities...")
+        choose_cities_btn.clicked.connect(self._open_city_picker)
+        choose_cities_btn.setToolTip(
+            "Restricts every generated search URL (Quick Start and the Target section's "
+            "'Load ... Search Links' buttons) to just the cities you check here, instead of "
+            "always spreading across all top 100."
+        )
+        cities_row.addWidget(choose_cities_btn)
+        self.cities_summary_label = QLabel("")
+        self.cities_summary_label.setStyleSheet("color: #8B95A7; font-size: 11px;")
+        cities_row.addWidget(self.cities_summary_label)
+        cities_row.addStretch(1)
+        self._update_cities_summary()
+
         target_hint = QLabel(
             f"(LOGY covers every city's first page before paging deeper into any one city - set this "
             f"to ~{len(CITY_POOL) * RESULTS_PER_PAGE} to reach all top {len(CITY_POOL)} cities at least "
@@ -237,6 +256,7 @@ class NewScrapeScreen(QWidget):
         target_hint.setStyleSheet("color: #8B95A7; font-size: 11px;")
         target_row.addWidget(target_hint, 1)
         layout.addLayout(target_row)
+        layout.addLayout(cities_row)
 
         self.auto_qualify_chk = QCheckBox("Auto-qualify leads (flag weak/missing websites automatically)")
         self.auto_qualify_chk.setToolTip(
@@ -275,118 +295,180 @@ class NewScrapeScreen(QWidget):
         self.options_section.setVisible(checked)
         self.proxy_section.setVisible(checked)
 
+    # ------------------------------------------------------------------
+    # SOURCES - "خليني اقدر من جوا اضيف مصادر جديدة": lets the user
+    # define a new scraping source (domain + container/fields selectors,
+    # optionally a 2nd-fetch detail_config) from inside the app instead
+    # of editing app/core/engine/builtin_templates.py by hand. Saved
+    # sources are stored via Database.create_custom_source() and merged
+    # with the built-ins (yellowpages, yelp, thumbtack) by
+    # get_all_source_profiles() - see _get_source_profiles() above -
+    # everywhere a multi-source ("All Sources") run is built.
+    # ------------------------------------------------------------------
+    def _build_sources_section(self) -> QWidget:
+        w, layout = card("Sources")
+        note = QLabel(
+            "Sites LOGY can pull leads from in an 'All Sources' run. yellowpages.com, yelp.com and "
+            "thumbtack.com are all captured live and ready to use. Note: thumbtack.com never publicly "
+            "shows a phone number or website on its pages (contact only happens through its own "
+            "gated 'Message' flow), so its leads carry business name + rating + a link back to its "
+            "Thumbtack profile only - not a selector gap, just what that site actually publishes. Add "
+            "any other site of your own below."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #8B95A7; font-size: 11px;")
+        layout.addWidget(note)
+
+        self.sources_list = QListWidget()
+        self.sources_list.setFixedHeight(120)
+        layout.addWidget(self.sources_list)
+
+        row = QHBoxLayout()
+        add_btn = QPushButton("+ Add Source")
+        add_btn.setObjectName("primaryButton")
+        add_btn.clicked.connect(self._add_source)
+        self.edit_source_btn = QPushButton("Edit")
+        self.edit_source_btn.clicked.connect(self._edit_source)
+        self.delete_source_btn = QPushButton("Delete")
+        self.delete_source_btn.setObjectName("dangerButton")
+        self.delete_source_btn.clicked.connect(self._delete_source)
+        row.addWidget(add_btn)
+        row.addWidget(self.edit_source_btn)
+        row.addWidget(self.delete_source_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self._refresh_sources_list()
+        return w
+
+    def _refresh_sources_list(self):
+        self.sources_list.clear()
+        custom_rows = self.db.list_custom_sources()
+        for profile in self._get_source_profiles():
+            custom_row = next(
+                (r for r in custom_rows if r["name"] == profile["name"] and r["domain"] == profile["domain"]),
+                None,
+            )
+            badge = "" if profile.get("verified", True) else "  ⚠ selectors not confirmed"
+            kind = "custom" if custom_row else "built-in"
+            item = QListWidgetItem(f"{profile['name']}  ({profile['domain']})  [{kind}]{badge}")
+            item.setData(Qt.ItemDataRole.UserRole, custom_row["id"] if custom_row else None)
+            self.sources_list.addItem(item)
+
+    def _add_source(self):
+        dialog = SourceDialog(self)
+        if dialog.exec():
+            self.db.create_custom_source(
+                dialog.result_name, dialog.result_domain, dialog.result_container,
+                dialog.result_fields, dialog.result_detail_config,
+            )
+            self._refresh_sources_list()
+
+    def _selected_custom_source_id(self) -> int | None:
+        item = self.sources_list.currentItem()
+        if not item:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _edit_source(self):
+        source_id = self._selected_custom_source_id()
+        if source_id is None:
+            QMessageBox.information(self, "Edit Source", "اختار مصدر مضاف من عندك الأول (المصادر الأساسية مش قابلة للتعديل من هنا).")
+            return
+        row = next(r for r in self.db.list_custom_sources() if r["id"] == source_id)
+        existing = {
+            "name": row["name"], "domain": row["domain"],
+            "container": json.loads(row["container_json"]),
+            "fields": json.loads(row["fields_json"]),
+            "detail_config": json.loads(row["detail_config_json"]) if row["detail_config_json"] else None,
+        }
+        dialog = SourceDialog(self, existing=existing)
+        if dialog.exec():
+            self.db.update_custom_source(
+                source_id, dialog.result_name, dialog.result_domain, dialog.result_container,
+                dialog.result_fields, dialog.result_detail_config,
+            )
+            self._refresh_sources_list()
+
+    def _delete_source(self):
+        source_id = self._selected_custom_source_id()
+        if source_id is None:
+            QMessageBox.information(self, "Delete Source", "اختار مصدر مضاف من عندك الأول (المصادر الأساسية مش قابلة للحذف).")
+            return
+        reply = QMessageBox.question(self, "Delete Source", "متأكد إنك عايز تمسح المصدر ده؟")
+        if reply == QMessageBox.StandardButton.Yes:
+            self.db.delete_custom_source(source_id)
+            self._refresh_sources_list()
+
+    def _open_city_picker(self):
+        dialog = CityPickerDialog(self, selected=self._selected_cities)
+        if dialog.exec():
+            self._selected_cities = dialog.selected_cities()
+            self._update_cities_summary()
+
+    def _update_cities_summary(self):
+        n = len(self._selected_cities)
+        total = len(CITY_POOL)
+        self.cities_summary_label.setText(f"All {total} cities" if n == total else f"{n} of {total} cities")
+
+    def _collect_cities(self) -> list[tuple[str, str]] | None:
+        """Cities picked via the 'Choose Cities...' dialog (see
+        _open_city_picker()) - defaults to the full CITY_POOL (every box
+        checked) until the user changes the selection. Every call site
+        in this file that generates niche URLs goes through this so the
+        city restriction applies everywhere consistently (Quick Start's
+        'Use this niche', the Target section's 'Load ... Search Links'
+        buttons, and 'All Sources')."""
+        return self._selected_cities or None
+
+    def _get_source_profiles(self) -> list[dict]:
+        """Built-in SOURCE_PROFILES (yellowpages, yelp, thumbtack) plus
+        whatever the user added via the Sources card's '+ Add Source' -
+        see builtin_templates.get_all_source_profiles(). Every call site
+        that used to import SOURCE_PROFILES directly for a multi-source
+        run now goes through this instead, so a user-added source
+        participates in 'All Sources' / 'Load All Sources (combined)'
+        with no other wiring."""
+        return get_all_source_profiles(self.db)
+
     def _apply_niche_template(self):
-        tpl_id = self.niche_combo.currentData()
-        if tpl_id is None:
+        # niche_combo's data is now always just the bare niche-name string
+        # (see _build_quick_start_section() above) - every pick always
+        # combines all 3 sources automatically, so this just delegates to
+        # the combined-sources logic. No more per-niche source choice.
+        niche_name = self.niche_combo.currentData()
+        if niche_name is None:
             return
-        if isinstance(tpl_id, tuple) and tpl_id[0] == "all_sources":
-            self._apply_all_sources_niche(tpl_id[1])
-            return
-        # Single-source pick (yellowpages-only or Yelp-only) - clear any
-        # multi-source state a previous "All Sources" pick may have set,
-        # otherwise job_manager would keep resolving selectors per-URL
-        # from SOURCE_PROFILES instead of using this template's own
-        # container/fields below.
-        self._active_source_profiles = None
-        for t in self.db.list_templates():
-            if t["id"] == tpl_id:
-                config = json.loads(t["config_json"])
-                fields = [ExtractionField.from_dict(f) for f in config.get("fields", [])]
-                self.field_builder.load_fields(fields)
-                self.auto_qualify_chk.setChecked(True)
-
-                # ICP niche templates now ship a real "Repeat over" selector
-                # (captured live from yellowpages.com - see
-                # app/core/engine/builtin_templates.py) so picking a niche
-                # is enough to run a real scrape with zero manual selector
-                # typing - this is the fix for "الكاستوم سيلكتور مش بينزل
-                # جاهز".
-                container = config.get("container")
-                if container and container.get("selector"):
-                    self.container_selector_input.setText(container["selector"])
-                    idx = self.container_type_combo.findText(container.get("type", "css"))
-                    if idx >= 0:
-                        self.container_type_combo.setCurrentIndex(idx)
-
-                # detail_config (Yelp only - see builtin_templates.py's
-                # _YELP_DETAIL_CONFIG) drives a second per-lead fetch in
-                # job_manager.py to fill in fields the listing page
-                # doesn't have (Yelp's search results have no phone
-                # number). Reassigned unconditionally on every apply, so
-                # switching from a Yelp niche back to a yellowpages one
-                # correctly clears it (config.get() is None for those).
-                self._active_detail_config = config.get("detail_config")
-
-                # Target URLs are generated fresh here (not just read from
-                # the template's small 2-city default) sized to how many
-                # leads the user asked for in "How many leads (approx.)" -
-                # this is the fix for "ليه دايما 30 بس، انا عايز الف/الفين":
-                # the old default was 2 cities x 1 page = ~50-60 leads,
-                # hard-capped regardless of what the user actually wanted.
-                # Which generator to use (and how many results a URL is
-                # worth) depends on the template's source.
-                source = config.get("source", "yellowpages")
-                if t["name"].startswith("SEO Leads (Yelp) - "):
-                    bare_niche = t["name"][len("SEO Leads (Yelp) - "):]
-                else:
-                    bare_niche = t["name"][len("SEO Leads - "):] if t["name"].startswith("SEO Leads - ") else t["name"]
-                target_count = self.target_results_spin.value()
-                if source == "yelp":
-                    start_urls = generate_niche_urls_yelp(bare_niche, target_count)
-                    results_per_page = YELP_RESULTS_PER_PAGE
-                    source_label = "Yelp"
-                    self._apply_yelp_anti_block_settings()
-                else:
-                    start_urls = generate_niche_urls(bare_niche, target_count)
-                    results_per_page = RESULTS_PER_PAGE
-                    source_label = "yellowpages.com"
-                if not start_urls:
-                    start_urls = config.get("start_urls") or []  # fallback to the template's static default
-                if start_urls:
-                    self.urls_input.setPlainText("\n".join(start_urls))
-                    # max_pages caps how many of these URLs actually get
-                    # fetched (app/core/job_manager.py) - without bumping
-                    # it, a large URL list would silently get truncated
-                    # back down to the old default of 50.
-                    self.max_pages_spin.setValue(max(len(start_urls), self.max_pages_spin.value()))
-
-                self.extraction_tabs.setCurrentIndex(self.TAB_CUSTOM)  # so the prefilled selectors are visible
-                if start_urls and container:
-                    est_low = len(start_urls) * (results_per_page // 2)
-                    est_high = len(start_urls) * results_per_page
-                    detail_note = " (+ فحص تليفون تاني لكل ليد، فهيبقى أبطأ)" if self._active_detail_config else ""
-                    self.quick_start_status.setText(
-                        f"✓ '{bare_niche}' جاهز بالكامل - {len(start_urls)} صفحة نتايج حقيقية من "
-                        f"{source_label} (تقريبًا {est_low}-{est_high} ليد متوقع، حسب العدد الحقيقي "
-                        f"المتاح لكل مدينة){detail_note}. الروابط والسلكتورات والـ Repeat over اتحطوا "
-                        "أوتوماتيك. دوس Start Scraping تحت على طول."
-                    )
-                else:
-                    self.quick_start_status.setText(
-                        f"✓ Output columns set for '{t['name']}'. Auto-qualify is ON. "
-                        "Now paste your target URL(s) below and fill in the selectors for that site."
-                    )
-                return
+        self._apply_all_sources_niche(niche_name)
 
     def _apply_all_sources_niche(self, niche_name: str):
-        """'All Sources' Quick Start pick: combine yellowpages.com + Yelp
-        URLs for this one niche into a SINGLE job's start_urls (see
-        generate_niche_urls_all_sources()), instead of the user running
-        one source, exporting, running the other source, and merging two
-        CSVs by hand. The Field Builder / container inputs below are only
-        the FALLBACK job_manager uses for a URL that matches neither known
-        domain (shouldn't happen with this generator's own output) - the
-        real per-URL selector choice happens at fetch time in
+        """Every Quick Start niche pick now combines yellowpages.com +
+        Yelp + thumbtack.com URLs for this one niche into a SINGLE job's
+        start_urls (see generate_niche_urls_all_sources()), instead of the
+        user running one source, exporting, running another, and merging
+        CSVs by hand - and without a separate "All Sources" option to
+        choose (see _apply_niche_template() above and "شيل ان يبقى فيه 3
+        اوبشن لكل نيش ... المصادر من ال 3 مواقع ... بشكل تلقائي"). The
+        Field Builder / container inputs below are only the FALLBACK
+        job_manager uses for a URL that matches neither known domain
+        (shouldn't happen with this generator's own output) - the real
+        per-URL selector choice happens at fetch time in
         job_manager.ScrapeJobWorker._resolve_source(), keyed off
-        self._active_source_profiles (SOURCE_PROFILES) set below."""
-        yp_profile = next(p for p in SOURCE_PROFILES if p["name"] == "yellowpages")
-        yelp_profile = next(p for p in SOURCE_PROFILES if p["name"] == "yelp")
+        self._active_source_profiles set below."""
+        source_profiles = self._get_source_profiles()
+        yp_profile = next(p for p in source_profiles if p["name"] == "yellowpages")
+        yelp_profile = next(p for p in source_profiles if p["name"] == "yelp")
+        thumbtack_profile = next((p for p in source_profiles if p["name"] == "thumbtack"), None)
 
         combined_fields = list(yp_profile["fields"])
         existing_names = {f.name for f in combined_fields}
-        for f in yelp_profile["fields"]:
-            if f.name not in existing_names:
-                combined_fields.append(f)
+        for extra_profile in (yelp_profile, thumbtack_profile):
+            if not extra_profile:
+                continue
+            for f in extra_profile["fields"]:
+                if f.name not in existing_names:
+                    combined_fields.append(f)
+                    existing_names.add(f.name)
         self.field_builder.load_fields(combined_fields)
 
         self.container_selector_input.setText(yp_profile["container"]["selector"])
@@ -396,11 +478,17 @@ class NewScrapeScreen(QWidget):
 
         self.auto_qualify_chk.setChecked(True)
         self._active_detail_config = None  # per-URL detail_config comes from source_profiles instead
-        self._active_source_profiles = SOURCE_PROFILES
+        # ALL source profiles (built-in + custom), not just the 3 named
+        # above, so a user-added source (e.g. one pasted in via its OWN
+        # start_urls further down in the Target box) still resolves
+        # correctly at fetch time even though
+        # generate_niche_urls_all_sources() below only knows how to
+        # generate URLs for yellowpages/Yelp/thumbtack themselves.
+        self._active_source_profiles = source_profiles
         self._apply_yelp_anti_block_settings()  # this run includes yelp.com URLs too
 
         target_count = self.target_results_spin.value()
-        start_urls = generate_niche_urls_all_sources(niche_name, target_count)
+        start_urls = generate_niche_urls_all_sources(niche_name, target_count, cities=self._collect_cities())
         if start_urls:
             self.urls_input.setPlainText("\n".join(start_urls))
             self.max_pages_spin.setValue(max(len(start_urls), self.max_pages_spin.value()))
@@ -408,12 +496,17 @@ class NewScrapeScreen(QWidget):
         self.extraction_tabs.setCurrentIndex(self.TAB_CUSTOM)
         if start_urls:
             yp_count = sum(1 for u in start_urls if "yellowpages.com" in u)
-            yelp_count = len(start_urls) - yp_count
+            yelp_count = sum(1 for u in start_urls if "yelp.com" in u)
+            thumbtack_count = len(start_urls) - yp_count - yelp_count
             self.quick_start_status.setText(
                 f"✓ '{niche_name}' جاهز - {len(start_urls)} رابط بحث ({yp_count} من yellowpages.com + "
-                f"{yelp_count} من yelp.com) في نفس القائمة تحت. كل رابط هياخد السلكتور بتاعه الصح "
-                "أوتوماتيك حسب مصدره - مش محتاج تشغلهم واحد واحد ولا تدمج نتايجهم بنفسك. دوس Start "
-                "Scraping على طول."
+                f"{yelp_count} من yelp.com + {thumbtack_count} من thumbtack.com) في نفس القائمة تحت. "
+                "كل رابط هياخد السلكتور بتاعه الصح أوتوماتيك حسب مصدره - مش محتاج تشغلهم واحد واحد ولا "
+                "تدمج نتايجهم بنفسك. ملحوظة: ليدز thumbtack.com هتيجي فيها اسم البيزنس + التقييم + "
+                "لينك بروفايل بس (مفيش تليفون ولا موقع - الموقع نفسه مش بينشرهم للعامة أصلاً)، وبعض "
+                "النيتشات (زي الأطباء/المحامين/وكلاء السيارات) ممكن مايكونش ليها تصنيف حقيقي في "
+                "thumbtack فتطلع صفر ليدز منه بس المصدرين التانيين هيغطوها عادي. دوس Start Scraping "
+                "على طول."
             )
         else:
             self.quick_start_status.setText(
@@ -580,25 +673,13 @@ class NewScrapeScreen(QWidget):
     def _current_niche_name_from_combo(self) -> str | None:
         """Bare niche name (e.g. 'Pool Builders') for whatever is
         currently picked in Quick Start's niche_combo above, or None if
-        it's still on 'Choose a niche...'. Works for all three kinds of
-        combo entries (yellowpages-only template id, Yelp-only template
-        id, or the ('all_sources', niche) tuple) - lets the Target
-        section's "Load ... Search Links" buttons below generate a FULL
-        top-100-city link list for whichever niche is already selected,
-        instead of always falling back to the small fixed 7-niche demo."""
-        data = self.niche_combo.currentData()
-        if data is None:
-            return None
-        if isinstance(data, tuple):
-            return data[1]
-        for t in self.db.list_templates():
-            if t["id"] == data:
-                if t["name"].startswith("SEO Leads (Yelp) - "):
-                    return t["name"][len("SEO Leads (Yelp) - "):]
-                if t["name"].startswith("SEO Leads - "):
-                    return t["name"][len("SEO Leads - "):]
-                return t["name"]
-        return None
+        it's still on 'Choose a niche...'. niche_combo's data is now
+        always just the bare niche-name string (see
+        _build_quick_start_section() above) - lets the Target section's
+        "Load ... Search Links" buttons below generate a FULL top-100-city
+        link list for whichever niche is already selected, instead of
+        always falling back to the small fixed 7-niche demo."""
+        return self.niche_combo.currentData()
 
     def _apply_yelp_anti_block_settings(self):
         """A real 500-page Yelp run reported back HTTP 403 on ~everything
@@ -636,7 +717,7 @@ class NewScrapeScreen(QWidget):
         the small fixed-city demo lists below are for when NO niche is
         picked yet (a quick 'does this even work' check), not the real
         per-niche generator."""
-        profile = next(p for p in SOURCE_PROFILES if p["name"] == source)
+        profile = next(p for p in self._get_source_profiles() if p["name"] == source)
         self.field_builder.load_fields(profile["fields"])
         self.container_selector_input.setText(profile["container"]["selector"])
         idx = self.container_type_combo.findText(profile["container"].get("type", "css"))
@@ -649,7 +730,11 @@ class NewScrapeScreen(QWidget):
             self._apply_yelp_anti_block_settings()
 
         target_count = self.target_results_spin.value()
-        start_urls = generate_niche_urls_yelp(niche_name, target_count) if source == "yelp" else generate_niche_urls(niche_name, target_count)
+        cities = self._collect_cities()
+        start_urls = (
+            generate_niche_urls_yelp(niche_name, target_count, cities=cities) if source == "yelp"
+            else generate_niche_urls(niche_name, target_count, cities=cities)
+        )
         if start_urls:
             self.urls_input.setPlainText("\n".join(start_urls))
             self.max_pages_spin.setValue(max(len(start_urls), self.max_pages_spin.value()))
@@ -786,13 +871,19 @@ class NewScrapeScreen(QWidget):
         combined = self.REAL_DIRECTORY_SEARCH_LINKS + self.YELP_REAL_DIRECTORY_SEARCH_LINKS
         self.urls_input.setPlainText("\n".join(combined))
 
-        yp_profile = next(p for p in SOURCE_PROFILES if p["name"] == "yellowpages")
-        yelp_profile = next(p for p in SOURCE_PROFILES if p["name"] == "yelp")
+        source_profiles = self._get_source_profiles()
+        yp_profile = next(p for p in source_profiles if p["name"] == "yellowpages")
+        yelp_profile = next(p for p in source_profiles if p["name"] == "yelp")
+        thumbtack_profile = next((p for p in source_profiles if p["name"] == "thumbtack"), None)
         combined_fields = list(yp_profile["fields"])
         existing_names = {f.name for f in combined_fields}
-        for f in yelp_profile["fields"]:
-            if f.name not in existing_names:
-                combined_fields.append(f)
+        for extra_profile in (yelp_profile, thumbtack_profile):
+            if not extra_profile:
+                continue
+            for f in extra_profile["fields"]:
+                if f.name not in existing_names:
+                    combined_fields.append(f)
+                    existing_names.add(f.name)
         self.field_builder.load_fields(combined_fields)
         self.container_selector_input.setText(yp_profile["container"]["selector"])
         idx = self.container_type_combo.findText(yp_profile["container"].get("type", "css"))
@@ -800,7 +891,7 @@ class NewScrapeScreen(QWidget):
             self.container_type_combo.setCurrentIndex(idx)
 
         self._active_detail_config = None  # handled per-URL via source_profiles instead
-        self._active_source_profiles = SOURCE_PROFILES
+        self._active_source_profiles = source_profiles
         self.auto_qualify_chk.setChecked(True)
         self._apply_yelp_anti_block_settings()  # this run includes yelp.com URLs too
         self.extraction_tabs.setCurrentIndex(self.TAB_CUSTOM)
@@ -1452,26 +1543,46 @@ class NewScrapeScreen(QWidget):
         fmt, ok = self._ask_export_format()
         if not ok:
             return
-        # "odoo_xlsx" is still a real .xlsx file (Odoo's CRM Lead import
-        # layout, see exporter.export_odoo_xlsx) - only the internal
-        # EXPORTERS key has the odoo_ prefix, the file extension on disk
-        # must stay .xlsx or Excel/Odoo won't recognize it.
-        extension = "xlsx" if fmt == "odoo_xlsx" else fmt
-        default_name = "crm_leads.xlsx" if fmt == "odoo_xlsx" else f"results.{extension}"
+        # "odoo_xlsx"/"odoo_xls" map to REAL .xlsx/.xls files respectively
+        # (see exporter.export_odoo_xlsx / export_odoo_xls) - only the
+        # internal EXPORTERS key has the odoo_ prefix, the file extension
+        # on disk must match the actual bytes written or Excel/Odoo may
+        # reject or mis-parse it. "عايزه يطلع XLS مش XSLS" - Odoo's own
+        # downloadable CRM Lead template is itself a "crm_lead 1.xls"
+        # file, so that's the default Odoo option now instead of .xlsx.
+        ODOO_EXTENSIONS = {"odoo_xlsx": "xlsx", "odoo_xls": "xls"}
+        extension = ODOO_EXTENSIONS.get(fmt, fmt)
+        default_name = f"crm_leads.{extension}" if fmt in ODOO_EXTENSIONS else f"results.{extension}"
         path, _ = QFileDialog.getSaveFileName(self, "Export results", default_name, f"*.{extension}")
         if not path:
             return
+        # Both odoo_* formats' "Channel" column is a required field only
+        # on THIS user's own Odoo instance (not part of Odoo's stock
+        # crm.lead import template - see exporter.py's
+        # DEFAULT_ODOO_CHANNEL_VALUE docstring) - its value comes from
+        # Settings -> "Odoo Export" (db setting "odoo_channel_value"),
+        # never guessed here.
+        extra_kwargs = {}
+        if fmt in ODOO_EXTENSIONS:
+            extra_kwargs["channel_value"] = self.db.get_setting("odoo_channel_value", exporter.DEFAULT_ODOO_CHANNEL_VALUE)
         try:
-            count = exporter.export(fmt, self.db.iter_all_results(self.current_job_id), path)
+            count = exporter.export(fmt, self.db.iter_all_results(self.current_job_id), path, **extra_kwargs)
             QMessageBox.information(self, "Export", f"تم تصدير {count} سجل إلى:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
     def _ask_export_format(self) -> tuple[str, bool]:
         from PySide6.QtWidgets import QInputDialog
+        # "Odoo CRM Lead template (.xls)" listed FIRST/default - matches
+        # Odoo's own downloadable template file, which is itself a
+        # "crm_lead 1.xls" (see exporter.export_odoo_xls's docstring for
+        # why this is a genuine legacy-format file, not just a renamed
+        # .xlsx). The .xlsx variant is kept available for anyone whose
+        # own Odoo import screen prefers .xlsx instead.
         labels = {
-            "csv": "csv", "json": "json", "jsonl": "jsonl", "xlsx": "xlsx",
+            "odoo_xls": "Odoo CRM Lead template (.xls)",
             "odoo_xlsx": "Odoo CRM Lead template (.xlsx)",
+            "csv": "csv", "json": "json", "jsonl": "jsonl", "xlsx": "xlsx",
         }
         label, ok = QInputDialog.getItem(self, "Export format", "Choose a format:", list(labels.values()), 0, False)
         if not ok:

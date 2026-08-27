@@ -94,6 +94,21 @@ CREATE TABLE IF NOT EXISTS lead_history (
     times_seen INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_lead_history_last_seen ON lead_history(last_seen_at);
+
+-- User-added scraping sources ("خليني اقدر من جوا اضيف مصادر جديدة") -
+-- domain + container/field selectors defined from inside the app (New
+-- Scrape's Sources card), rather than only the hardcoded SOURCE_PROFILES
+-- in app/core/engine/builtin_templates.py. See get_all_source_profiles()
+-- there for how these are merged with the built-in sources at run time.
+CREATE TABLE IF NOT EXISTS custom_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    container_json TEXT NOT NULL,
+    fields_json TEXT NOT NULL,
+    detail_config_json TEXT,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -336,6 +351,45 @@ class Database:
     def delete_lead_history_entry(self, fingerprint: str) -> None:
         with self.cursor() as cur:
             cur.execute("DELETE FROM lead_history WHERE fingerprint = ?", (fingerprint,))
+
+    # ---------------- Custom sources (user-added, for "All Sources" runs) ----------------
+    def create_custom_source(
+        self, name: str, domain: str, container: dict, fields: list[dict],
+        detail_config: Optional[dict] = None,
+    ) -> int:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO custom_sources (name, domain, container_json, fields_json, detail_config_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    name, domain, json.dumps(container), json.dumps(fields),
+                    json.dumps(detail_config) if detail_config else None, time.time(),
+                ),
+            )
+            return cur.lastrowid
+
+    def list_custom_sources(self) -> list[dict]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM custom_sources ORDER BY created_at ASC")
+            return [dict(r) for r in cur.fetchall()]
+
+    def update_custom_source(
+        self, source_id: int, name: str, domain: str, container: dict, fields: list[dict],
+        detail_config: Optional[dict] = None,
+    ) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE custom_sources SET name = ?, domain = ?, container_json = ?, "
+                "fields_json = ?, detail_config_json = ? WHERE id = ?",
+                (
+                    name, domain, json.dumps(container), json.dumps(fields),
+                    json.dumps(detail_config) if detail_config else None, source_id,
+                ),
+            )
+
+    def delete_custom_source(self, source_id: int) -> None:
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM custom_sources WHERE id = ?", (source_id,))
 
     # ---------------- Settings ----------------
     def get_setting(self, key: str, default: Any = None) -> Any:
