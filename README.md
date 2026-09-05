@@ -1,7 +1,7 @@
 # LOGY
 
 A desktop GUI for web scraping and lead generation, built on top of the
-[Scrapling](https://github.com/D4Vinci/Scrapling) scraping engine.
+Custom scraping engine.
 
 ## What's implemented
 
