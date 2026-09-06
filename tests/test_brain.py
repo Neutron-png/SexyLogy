@@ -158,6 +158,72 @@ def test_persona_deterministic_per_identity():
     assert len(brain_mod._PERSONAS) > 1  # personas actually vary
 
 
+# ---------------- UCB1 selection mode ----------------
+
+def test_ucb1_plays_untried_identities_first():
+    # init phase: an unmeasured arm is the biggest unknown → played first,
+    # regardless of how good the veteran looks
+    b = _fresh_brain()
+    b.identity("veteran").successes = 100
+    b.identity("veteran").blocks = 0
+    assert all(b.pick(["veteran", "rookie"], "x.com", mode="ucb1") == "rookie" for _ in range(20))
+
+
+def test_ucb1_prefers_better_mean_when_equally_sampled():
+    b = _fresh_brain()
+    b.identity("a").successes = 9
+    b.identity("a").blocks = 1      # mean 0.9, n=10
+    b.identity("b").successes = 5
+    b.identity("b").blocks = 5      # mean 0.5, n=10
+    picks = [b.pick(["a", "b"], "x.com", mode="ucb1") for _ in range(100)]
+    # equal plays → equal exploration bonus → the mean decides
+    assert picks.count("a") >= 95
+
+
+def test_ucb1_exploration_bonus_rescues_uncertain_identity():
+    # a: mean 0.8 with n=100 (well measured)
+    # b: mean 0.9 with n=4 (better mean, barely measured)
+    # bonus_b = sqrt(2·ln(104)/4) ≈ 1.52  vs  bonus_a ≈ 0.30
+    # optimism says: measure the uncertain better arm → b wins
+    b = _fresh_brain()
+    b.identity("a").successes = 80
+    b.identity("a").blocks = 20
+    b.identity("b").successes = 3
+    b.identity("b").blocks = 1
+    picks = [b.pick(["a", "b"], "x.com", mode="ucb1") for _ in range(50)]
+    assert picks.count("b") > picks.count("a")
+
+
+def test_ucb1_bonus_decays_with_evidence():
+    # after enough plays, the bonus term vanishes relative to the mean gap:
+    # a (mean 0.9, n=10000) must dominate b (mean 0.5, n=10000)
+    b = _fresh_brain()
+    b.identity("a").successes = 9000
+    b.identity("a").blocks = 1000
+    b.identity("b").successes = 5000
+    b.identity("b").blocks = 5000
+    picks = [b.pick(["a", "b"], "x.com", mode="ucb1") for _ in range(50)]
+    assert picks.count("a") == 50
+
+
+def test_ucb1_respects_cooldowns():
+    b = _fresh_brain()
+    b.identity("a").successes = 50
+    b.identity("b").successes = 10
+    b.identity("a").blocked_until = time.time() + 999   # best arm is benched
+    picks = [b.pick(["a", "b"], "x.com", mode="ucb1") for _ in range(20)]
+    assert all(p == "b" for p in picks)
+
+
+def test_selection_mode_weighted_ignores_sticky():
+    b = _fresh_brain()
+    for i in range(3):
+        b.record(f"p{i}", "yelp.com", blocked=False)
+    picks = [b.pick(["p0", "p1", "p2"], "yelp.com", mode="weighted") for _ in range(200)]
+    # no stickiness: all three healthy identities should actually rotate
+    assert len(set(picks)) == 3
+
+
 # ---------------- domain policy: AIMD + WAF breaker ----------------
 
 def test_aimd_speeds_up_on_success_and_slows_on_block():

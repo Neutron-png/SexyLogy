@@ -309,6 +309,18 @@ class NewScrapeScreen(QWidget):
     # ------------------------------------------------------------------
     def _build_intelligence_section(self) -> QWidget:
         w, layout = card("Intelligence (يحفظ ويتعلم عبر الجريات)")
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("Selection"))
+        self.selection_combo = QComboBox()
+        self.selection_combo.addItems([
+            "Sticky + weighted (default)",
+            "Weighted only (pure posterior)",
+            "UCB1 - optimism (most exploratory)",
+        ])
+        sel_row.addWidget(self.selection_combo)
+        sel_row.addStretch(1)
+        layout.addLayout(sel_row)
+
         self.pacing_combo = QComboBox()
         self.pacing_combo.addItems([
             "Fixed delay (classic)",
@@ -1487,6 +1499,7 @@ class NewScrapeScreen(QWidget):
             owner_lookup_enabled=self.owner_lookup_chk.isChecked(),
             skip_duplicate_leads=self.skip_duplicates_chk.isChecked(),
             pacing_mode=("fixed", "aimd", "burst")[self.pacing_combo.currentIndex()],
+            identity_selection=("sticky", "weighted", "ucb1")[self.selection_combo.currentIndex()],
             use_identity_memory=self.identity_memory_chk.isChecked(),
             use_response_cache=self.response_cache_chk.isChecked(),
             discover_sitemap=self.sitemap_chk.isChecked(),

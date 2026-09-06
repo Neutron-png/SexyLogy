@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Optimism as an Algorithm — UCB1 and the Bandit Behind the Crawler — LOGY Engineering Poster № 06</title>
+<style>
+  :root{--bg:#f4f1e8;--ink:#141414;--yellow:#ffd400;--blue:#2b5cff;--red:#ff4b33;--green:#0e9f5f;
+    --sans:'Archivo Black','Segoe UI',sans-serif;--body:'Segoe UI',system-ui,sans-serif;--mono:Consolas,'Cascadia Code',monospace}
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:var(--body);line-height:1.75;padding:40px 20px;font-size:16px}
+  .wrap{max-width:940px;margin:0 auto}
+
+  .sticker{display:inline-block;background:var(--yellow);border:3px solid var(--ink);padding:6px 16px;
+    font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:2px;box-shadow:6px 6px 0 var(--ink);text-transform:uppercase}
+  h1{font-family:var(--sans);font-size:70px;line-height:.95;letter-spacing:-2px;text-transform:uppercase;margin:34px 0 10px}
+  h1 .hl{background:linear-gradient(transparent 55%,var(--yellow) 55%)}
+  @media(max-width:700px){h1{font-size:44px}}
+  .dek{font-size:19px;max-width:680px;margin-bottom:36px;font-weight:500}
+  .tag-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+  .tag{border:2px solid var(--ink);padding:6px 16px;font-family:var(--mono);font-size:12px;font-weight:700;background:#fff;box-shadow:4px 4px 0 var(--ink)}
+  .tag.red{background:var(--red);color:#fff}
+  .tag.green{background:var(--green);color:#fff}
+
+  .block{border:3px solid var(--ink);background:#fff;box-shadow:8px 8px 0 var(--ink);padding:32px 34px;margin:38px 0}
+  .block h2{font-family:var(--sans);font-size:24px;text-transform:uppercase;letter-spacing:-.5px;margin-bottom:6px}
+  .block h2 .no{display:inline-block;background:var(--ink);color:var(--yellow);padding:2px 12px;margin-right:12px;font-size:18px}
+  .block .why{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+    border:2px solid var(--ink);background:var(--yellow);padding:2px 10px;margin:4px 0 18px}
+  p{font-size:16.5px;margin-bottom:15px;max-width:660px}
+  p b{color:var(--blue)}
+  p .r{color:var(--red);font-weight:600}
+  ul{margin:0 0 15px 22px;max-width:640px}
+  li{margin-bottom:8px}
+  li b{color:var(--blue)}
+  code{font-family:var(--mono);font-size:14px;background:var(--bg);border:1px solid var(--ink);padding:1px 6px}
+
+  .eq{background:var(--ink);color:#fff;padding:20px 24px;font-family:var(--mono);font-size:13.5px;line-height:2;margin:18px 0;overflow-x:auto;white-space:pre}
+  .eq .y{color:var(--yellow)}.eq .b{color:#7ea2ff}.eq .g{color:#5ce8a4}.eq .r{color:#ff8a7a}.eq .cm{color:#999;font-style:italic}
+  .eq-cap{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#666;margin-bottom:-10px}
+
+  .work{border:3px dashed var(--ink);background:var(--bg);padding:20px 24px;margin:18px 0}
+  .work .cap{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
+  .work table{width:100%;border-collapse:collapse;font-size:14px}
+  .work th{text-align:left;border-bottom:2px solid var(--ink);padding:7px 12px;font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase}
+  .work td{padding:7px 12px;border-bottom:1px solid var(--ink)}
+  .ok{color:var(--green);font-weight:700}.bad{color:var(--red);font-weight:700}
+
+  .pull{border:3px solid var(--ink);background:var(--yellow);box-shadow:8px 8px 0 var(--ink);padding:22px 26px;
+    font-family:var(--sans);font-size:20px;text-transform:uppercase;line-height:1.4;margin:38px 0}
+
+  footer{margin-top:60px;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+    border-top:3px solid var(--ink);padding-top:16px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <span class="sticker">TECHNICAL POSTER · № 06 · SEQUEL TO № 05</span>
+  <h1>OPTIMISM AS<br>AN <span class="hl">ALGORITHM</span></h1>
+  <p class="dek">The multi-armed bandit problem, the wrong answer a smart student gives, the right answer with its proof, and the exact 40 lines where it now lives in production. Written for people who already scrape — every claim carries its reason.</p>
+  <div class="tag-row">
+    <span class="tag">UCB1</span>
+    <span class="tag green">Regret O(ln T / Δ)</span>
+    <span class="tag">Thompson Sampling</span>
+    <span class="tag red">Adversarial WAFs</span>
+    <span class="tag">Chernoff–Hoeffding</span>
+    <span class="tag">Lai–Robbins bound</span>
+  </div>
+
+  <!-- ==================== 01 ==================== -->
+  <div class="block">
+    <h2><span class="no">01</span>The Exam Question — Formalizing the Crawler's Dilemma</h2>
+    <div class="why">Why formalize at all</div>
+    <p>Picture a hall with <b>n slot machines</b> (the name "bandit" comes from the one-armed kind). Machine <code>i</code> pays out with unknown probability <code>μᵢ</code>. You have exactly <b>T rounds</b>. Each round you pull one machine and observe one reward. How do you spend your rounds?</p>
+    <p>This is not an analogy we reached for — it is a <em>reduction</em>. In LOGY, the machines are identities, the payout probability is each identity's true success rate against the target, the rounds are requests, and "one reward per pull" is exactly the cruel constraint of crawling: <b>you only learn about the identity you used</b>. Pull identity #3, and you learn nothing about #4, #5, #6. That one-sided feedback is the defining difficulty of the whole field.</p>
+    <div class="eq-cap">EQ. 1.1 — The formal statement</div>
+    <div class="eq">machines: i ∈ {1..n},   unknown payout probabilities μ₁..μₙ
+horizon:  T rounds total
+<span class="y">goal: maximize Σ rewards — equivalently, minimize regret</span></div>
+    <p><b>Why formalize:</b> without a formal statement you cannot measure an answer. With one, you can say "this strategy is provably better" instead of "this one feels smarter" — and poster № 05's whole ledger design becomes testable mathematics instead of folklore.</p>
+  </div>
+
+  <!-- ==================== 02 ==================== -->
+  <div class="block">
+    <h2><span class="no">02</span>The Wrong Answer — A Smart Student's Proposal, Dissected</h2>
+    <div class="why">Why being wrong here is instructive, not embarrassing</div>
+    <p>Given the problem, a smart student answered: <em>"Try every machine — say 5 iterations each — then compute the entropy of each one."</em> Grade the pieces:</p>
+    <ul>
+      <li><b>"Try every machine first" — correct family.</b> This is genuinely a known algorithm class: <b>Explore-Then-Commit (ETC)</b>. Uniform exploration, then commit. Respectable instinct.</li>
+      <li><b>"5 iterations" — statistically empty.</b> To tell a μ=0.5 machine from a μ=0.6 machine with 95% confidence, Chernoff–Hoeffding says you need <code>n ≥ ln(2/δ)/2Δ² ≈ 370</code> samples. With 5, one lucky win moves your estimate by 20%. You are not measuring — you are narrating noise.</li>
+      <li><b>"Compute the entropy" — the wrong statistic entirely.</b> Entropy measures the <em>spread</em> of a distribution, not its <em>quality</em>. Watch it fail:</li>
+    </ul>
+    <div class="work">
+      <div class="cap">The counterexample that kills entropy ranking</div>
+      <table>
+        <tr><th>Machine</th><th>Behavior</th><th>Outcome entropy</th><th>Entropy ranking</th></tr>
+        <tr><td>A</td><td>pays <b>every single pull</b></td><td class="bad">0 bits (constant!) </td><td class="bad">last place</td></tr>
+        <tr><td>B</td><td>fair coin — 50/50 win/lose</td><td class="ok">1 bit (maximum)</td><td class="ok">first place</td></tr>
+      </table>
+      <p style="margin-top:12px;margin-bottom:0">Entropy peaks at the coin flip. Rank by it and you <em>reward mediocrity and punish the guaranteed winner</em> — the exact inversion of the goal. The correct statistic is the <b>empirical mean</b> <code>x̄ᵢ = wins / pulls</code>. (Entropy has a legitimate role in this system — measuring the human-likeness of <em>timing patterns</em>, poster № 05 § 08 — just not here.)</p>
+    </div>
+    <p><b>The third, deeper miss:</b> ETC commits once. But the WAF is an <em>adversary that changes its mind</em> — the identity that was clean at page 50 may be burned at page 200. A one-shot decision is frozen into a world that moves. (§ 06 handles this.)</p>
+  </div>
+
+  <!-- ==================== 03 ==================== -->
+  <div class="block">
+    <h2><span class="no">03</span>The Real Difficulty — Why This Problem Is Hard When Its Code Is Trivial</h2>
+    <div class="why">Computational complexity vs statistical complexity</div>
+    <p>Here is the twist that puts bandits above intermediate material: <b>the algorithm is trivial to run and impossible to shortcut.</b> Each step costs O(n) arithmetic. There is no NP-hardness here. The difficulty lives somewhere else entirely — in <b>sample complexity</b>: <em>how many observations does any strategy need before its decisions are right?</em></p>
+    <div class="pull">The question is not "can we solve it?" — it's "how many pulls does the truth cost?"</div>
+    <p>This is the dividing line between classical complexity theory and <b>learning theory</b>. In the bandit world the yardstick is <b>regret</b> — the price of not knowing:</p>
+    <div class="eq-cap">EQ. 3.1 — Regret: the formal measure of every mistake</div>
+    <div class="eq">R(T) = T · μ* − E[ Σₜ μ_{A(t)} ]        <span class="cm"># μ* = best machine's true rate</span>
+<span class="cm"># "what we'd have earned pulling the best machine every time,</span>
+<span class="cm">#  minus what we actually earned"</span>
+<span class="g">a learner = a strategy whose R(T)/T → 0</span></div>
+    <p>Both stupid strategies have <b>linear</b> regret: pure exploitation locks onto the wrong machine forever (R grows linearly), pure exploration wastes a fixed fraction of every round (also linear). A learner must be sublinear — and how sublinear is exactly what the next section buys.</p>
+  </div>
+
+  <!-- ==================== 04 ==================== -->
+  <div class="block">
+    <h2><span class="no">04</span>UCB1 — Optimism in the Face of Uncertainty</h2>
+    <div class="why">The algorithm, then the reason for every symbol</div>
+    <p>Auer, Cesa-Bianchi &amp; Fischer (2002). The full algorithm, production form:</p>
+    <div class="eq-cap">EQ. 4.1 — UCB1, complete</div>
+    <div class="eq"><span class="cm"># init: play every machine once</span>
+for i in 1..n:  play(i);  record x̄ᵢ, nᵢ = 1
+
+<span class="cm"># every round t afterwards:</span>
+for every machine i:
+    <span class="y">score(i) = x̄ᵢ + √( 2 ln t / nᵢ )</span>
+play(argmax score);  update x̄ᵢ, nᵢ</div>
+    <p><b>The philosophy, stated once and taken seriously:</b> <em>be optimistic about the uncertain.</em> A machine you know little about gets credited with a bonus — treat its unknown as potential, sample it, and let evidence settle the argument. The bonus is not a heuristic; it is a <b>confidence interval</b>, computed so that the true μᵢ stays inside the interval with overwhelming probability. "Play the optimistic estimate" is "play the machine whose <em>best case</em> is highest" — and best cases converge to truth as evidence piles up.</p>
+    <p><b>Why the two terms behave the way they must:</b></p>
+    <ul>
+      <li><code>x̄ᵢ</code> — <b>exploitation.</b> What you've seen. It pulls selection toward proven quality.</li>
+      <li><code>√(2 ln t / nᵢ)</code> — <b>exploration with a decay schedule.</b> Three properties fall out of the algebra automatically: grows when <code>nᵢ</code> is small (untested machines get their chance), shrinks as <code>nᵢ</code> grows (proven machines speak from their record), and grows only logarithmically in <code>t</code> (late in the run, even a totally untested machine gets <em>one</em> chance soon, not endless chances).</li>
+    </ul>
+    <div class="work">
+      <div class="cap">Worked example — the bonus rescuing an uncertain better arm</div>
+      <table>
+        <tr><th>Identity</th><th>Record</th><th>Mean x̄ᵢ</th><th>Bonus √(2ln T/nᵢ)</th><th>UCB score</th><th>Verdict</th></tr>
+        <tr><td>a</td><td>80 ok / 20 blocked (n=100)</td><td>0.80</td><td>≈ 0.30</td><td>1.10</td><td class="bad">loses</td></tr>
+        <tr><td>b</td><td>3 ok / 1 blocked (n=4)</td><td>0.75</td><td>≈ 1.52</td><td class="ok">2.27</td><td class="ok">picked</td></tr>
+      </table>
+      <p style="margin-top:12px;margin-bottom:0">Same setting as our unit test <code>test_ucb1_exploration_bonus_rescues_uncertain_identity</code>: b's mean is barely better but barely <em>measured</em> — optimism orders the engine to go find out. Twenty rounds later, b's bonus has shrunk and the pool settles wherever the truth is. Note what did <em>not</em> happen: no threshold was tuned, no schedule was set. The decay is inside the formula.</p>
+    </div>
+  </div>
+
+  <!-- ==================== 05 ==================== -->
+  <div class="block">
+    <h2><span class="no">05</span>The Guarantee — Why This Is the Shortest Possible Road</h2>
+    <div class="why">What is actually proven, and why it matters</div>
+    <p>The proof skeleton (the honest three-step version):</p>
+    <ul>
+      <li><b>Step 1 — concentration.</b> <b>Chernoff–Hoeffding:</b> the empirical mean deviates from the true mean by more than ε with probability ≤ 2e^(−2nε²). With the bonus set to <code>√(2 ln t / nᵢ)</code>, the optimistic estimate stays above the true μᵢ "almost always" — and the "almost" tightens exponentially with every pull.</li>
+      <li><b>Step 2 — decomposition.</b> Regret splits over machines: each bad machine's total contribution equals (its suboptimality Δᵢ) × (number of times it was pulled). So bounding regret = bounding pulls on bad machines.</li>
+      <li><b>Step 3 — the punchline.</b> The bonus shrinks as <code>ln t</code>, and each bad pull raises the good machines' bonus relative to it — so bad machines self-limit. Result:</li>
+    </ul>
+    <div class="eq-cap">EQ. 5.1 — The UCB1 regret bound (Auer et al. 2002)</div>
+    <div class="eq">R(T) ≤ <span class="g">O( Σᵢ ln T / Δᵢ )</span>        <span class="cm"># Δᵢ = μ* − μᵢ</span></div>
+    <p><b>And the other half, which is the beautiful part:</b> <b>Lai–Robbins (1985)</b> proved a lower bound — <em>no</em> algorithm can do better than <code>Ω(ln T / Δᵢ)</code> for every problem instance. Two independent results, twenty years apart, meeting exactly:</p>
+    <div class="pull">Upper bound = lower bound. UCB1 is optimal up to constants. There is no smarter road — only faster constants.</div>
+    <p><b>Why sublinear regret means "learning":</b> R(T) growing like ln T means average regret R(T)/T → 0. Double your crawl and your <em>rate</em> of wasted requests doesn't double — it falls. The system's mistakes become history, not habit.</p>
+  </div>
+
+  <!-- ==================== 06 ==================== -->
+  <div class="block">
+    <h2><span class="no">06</span>Thompson Sampling — The Bayesian Sibling</h2>
+    <div class="why">Same order of optimality, different philosophy, zero hyperparameters</div>
+    <p>Thompson (1933 — rejected by reviewers, forgotten for 70 years, then resurrected by Google's ad systems). The alternative solution:</p>
+    <div class="eq-cap">EQ. 6.1 — Thompson sampling, complete</div>
+    <div class="eq">for every round:
+    for every machine i:  <span class="b">draw θᵢ ~ Beta(αᵢ, βᵢ)</span>      <span class="cm"># sample from the belief, not the mean</span>
+    play(argmax θᵢ)
+    αᵢ += reward;  βᵢ += (1 − reward)</div>
+    <p><b>Why exploration happens without being written down:</b> an uncertain machine has a <em>wide</em> posterior — its samples sometimes land high, so it gets played, and sometimes low, so it waits. As data accumulates the posterior narrows, sampling converges to the mean, and exploration dies <em>at exactly the rate the evidence justifies</em>. No `t`, no bonus formula, no schedule — the uncertainty itself schedules the exploration.</p>
+    <p><b>And this is literally poster № 05's ledger:</b> the <code>IdentityLedger</code> maintains Beta(α,β) per identity, and the <code>"sticky"/"weighted"</code> selection modes sample from (or near) those posteriors. Thompson is the fully-sampled version of what we already built. The UCB1 mode added in this release is its frequentist sibling — same optimal order, different metaphysics, and (below) a different failure mode against the adversary.</p>
+  </div>
+
+  <!-- ==================== 07 ==================== -->
+  <div class="block">
+    <h2><span class="no">07</span>The Adversary Breaks the Model — And What We Do About It</h2>
+    <div class="why">The honest asterisk on every proof above</div>
+    <p>Both UCB1 and Thompson assume rewards are drawn from <b>fixed</b> distributions. The WAF is not fixed — it is a player: it escalates against repetition, cools down after quiet, and reacts to your strategy. Under a changing μᵢ, the ln T regret bound does not just weaken — <b>it can silently break</b>, because the "best machine" the analysis optimizes toward stops existing.</p>
+    <p><b>The formal answer:</b> <b>adversarial bandits</b> — the nonstochastic model (Auer et al. 2002b), solved by <b>EXP3</b>: exponential weights over estimated rewards, with importance weighting to handle the one-sided feedback:</p>
+    <div class="eq-cap">EQ. 7.1 — EXP3's update (weights, not posteriors)</div>
+    <div class="eq">P(t+1, i) ∝ exp( η · ĝᵢ(t) )        <span class="cm"># ĝ = reward estimate scaled by 1/P(played)</span>
+<span class="g">R(T) = O( √(n T ln n) )              # sublinear even vs an adaptive adversary</span></div>
+    <p><b>The engineering answer (what LOGY ships):</b> rather than full EXP3, we armor the stochastic learner against non-stationarity with three mechanisms from poster № 05:</p>
+    <ul>
+      <li><b>Cooldowns</b> — a benched identity returns to eligibility after 300s, so a temporarily-burned arm can recover when the WAF's mood cools. Non-stationarity is survived by <em>forgetting slowly</em>, not by discarding evidence.</li>
+      <li><b>The WAF state filter</b> — the log-odds observer is, in bandit language, a <b>change detector</b>: it estimates when the environment shifted, which is precisely the assumption UCB1's proof requires you to notice.</li>
+      <li><b>Sticky's 30% churn</b> — a permanent, small exploration floor that keeps sampling every arm, so a recovery is <em>observed</em>, not assumed.</li>
+    </ul>
+    <p><b>The composed claim, precisely:</b> UCB1 gives the optimal <em>steady-state</em> policy; the armor gives <em>recovery</em> when steady state is violated. Neither alone is enough; together they match what EXP3 guarantees, with better constants in the common (mildly adversarial) case.</p>
+  </div>
+
+  <!-- ==================== 08 ==================== -->
+  <div class="block">
+    <h2><span class="no">08</span>The Walkthrough — Eight Identities, One Run, Round by Round</h2>
+    <div class="why">The algorithm you can watch, not just prove</div>
+    <div class="work">
+      <div class="cap">UCB1 scores over a run — T = total recorded pulls across the pool</div>
+      <table>
+        <tr><th>Round</th><th>Identity states (mean, n)</th><th>T</th><th>Who plays &amp; why</th></tr>
+        <tr><td>1–8</td><td>all (—, 0)</td><td>0</td><td>init phase: every identity once — unmeasured arms first, by design</td></tr>
+        <tr><td>9</td><td>p1 (.80,1) p2 (.40,1) p3 (.60,1) …</td><td>8</td><td>p2's bonus: √(2ln8/1)≈1.51 → score 1.91 beats p1's 1.80 — <b>even the bad arm is re-asked once</b></td></tr>
+        <tr><td>~20</td><td>p1 (.80,8) p2 (.33,6) p3 (.60,5)</td><td>19</td><td>p1's bonus: √(2ln19/8)≈0.71 → 1.51 beats p2's 0.38+0.78=1.16 — <b>the good arm takes over</b></td></tr>
+        <tr><td>~100</td><td>p1 (.80,70) p2 (.30,10) p3 (.60,15)</td><td>95</td><td>p2's bonus: √(2ln95/10)≈0.92 → 1.22 vs p1's 0.80+0.21=1.01 — <b>one periodic re-check</b>, then back</td></tr>
+        <tr><td>~500</td><td>p1 (.80,400) rest measured</td><td>500</td><td>p1 dominates; other arms pull roughly ln-shaped traffic — <b>the ledger's shape IS the log</b></td></tr>
+      </table>
+      <p style="margin-top:12px;margin-bottom:0">Read the last column top to bottom and you can see the exploration budget spending itself: generous at first, one re-check per bad arm per epoch, near-zero at the end — with the <em>shape</em> of the spending dictated by <code>ln</code>, not by anyone's config.</p>
+    </div>
+  </div>
+
+  <!-- ==================== 09 ==================== -->
+  <div class="block">
+    <h2><span class="no">09</span>Where It Lives — The 40 Lines in Production</h2>
+    <div class="why">Because a proof that never ships is a paper</div>
+    <p>The selection is now a three-way policy in <code>brain.py</code>, chosen per job from the UI:</p>
+    <div class="eq-cap">brain.py — the shipped implementation (abridged to its decision core)</div>
+    <div class="eq"><span class="kw">def</span> <span class="fn">_pick_ucb1</span>(self, eligible):
+    plays = {k: identity(k).successes + identity(k).blocks <span class="kw">for</span> k <span class="kw">in</span> eligible}
+    untried = [k <span class="kw">for</span> k <span class="kw">in</span> eligible <span class="kw">if</span> plays[k] == <span class="st">0</span>]
+    <span class="kw">if</span> untried:
+        <span class="kw">return</span> random.choice(untried)          <span class="cm"># init phase: measure the unknown</span>
+    total = sum(plays.values())
+    <span class="kw">def</span> <span class="fn">score</span>(k):
+        s = identity(k)
+        <span class="kw">return</span> s.successes/(s.successes+s.blocks) + <span class="y">math.sqrt(2*math.log(total)/plays[k])</span>
+    <span class="kw">return</span> max(eligible, key=score)</div>
+    <p><b>Engineering notes on the mapping:</b> <code>nᵢ</code> is not a separate counter — it is <code>α+β</code>, the posterior <em>concentration</em> from № 05, which means UCB1 and Thompson read the same ledger. The untried-first branch is UCB1's initialization played exactly as specified. And cooldown filtering sits <em>outside</em> the score: a benched arm isn't scored at all — optimism must never select an identity the breaker just parked.</p>
+    <p><b>Which mode, when:</b> <code>sticky</code> for human-shape under stable targets; <code>weighted</code> when you want pure posterior behavior with zero stickiness; <code>ucb1</code> for fresh pools against new targets — it is the fastest legitimate way to <em>map</em> a target's tolerance, because it front-loads measurement exactly where the uncertainty is.</p>
+  </div>
+
+  <!-- ==================== 10 ==================== -->
+  <div class="block">
+    <h2><span class="no">10</span>Honest Limits — Where the Optimism Stops Paying</h2>
+    <div class="why">Failure modes, priced</div>
+    <ul>
+      <li><b>Stationarity is an assumption, not a fact.</b> Every guarantee above conditions on fixed μᵢ. Against a responsive WAF the bound is not "weaker" — it is <em>unproven</em>. That is why § 07's armor exists and why the default mode is sticky, not UCB1.</li>
+      <li><b>Optimism has a cost during exploration.</b> UCB1 <em>will</em> play bad arms periodically, forever (that's the ln term). Against a target where a single block is catastrophic (burns the IP for the whole job), that price can exceed the information bought. Weighted/sticky sampling loses the optimality proof but never over-invests in a dying arm.</li>
+      <li><b>The mean is not the whole story.</b> UCB1 ranks by success <em>rate</em>; it is blind to <em>latency</em>. A 99%-clean identity that takes 9s per page may be worse for throughput than a 95% one at 0.4s. Fixing this properly means reward shaping (e.g. reward = success/latency) — a real extension, deliberately not smuggled in.</li>
+      <li><b>One-sided feedback is the real tax.</b> You only observe the arm you played. All the ln T cost of bandits is, at bottom, the price of that blindness. Full-information problems (you see every arm's reward) admit much faster learners — the crawler's constraint is what makes the problem interesting.</li>
+    </ul>
+    <div class="work">
+      <div class="cap">Scorecard — the three policies, side by side</div>
+      <table>
+        <tr><th>Policy</th><th>Guarantee</th><th>Strength</th><th>Weakness</th></tr>
+        <tr><td>Sticky + weighted (default)</td><td>none formal</td><td>human-shaped, self-correcting</td><td>no optimality claim</td></tr>
+        <tr class="hl"><td><b>UCB1 (new)</b></td><td class="ok">R(T) = O(ln T/Δ), optimal up to constants</td><td>provably fastest mapping of a new target</td><td>pays scheduled exploration; assumes stationarity</td></tr>
+        <tr><td>Thompson (≈ weighted mode)</td><td>same order as UCB1</td><td>no hyperparameters; uncertainty self-schedules</td><td>slower initial exploration than UCB1</td></tr>
+        <tr><td>EXP3 (theoretical)</td><td>O(√(nT ln n)) vs adversary</td><td>survives adaptive opponents</td><td>weaker constants; not shipped</td></tr>
+      </table>
+    </div>
+    <div class="pull">Optimism is not a personality trait. It is a provably optimal allocation policy — with a decay term.</div>
+  </div>
+
+  <footer>
+    <span>LOGY ENGINEERING POSTER SERIES · № 06 · 2026</span>
+    <span>REFS: AUER ET AL. 2002 · THOMPSON 1933 · LAI–ROBBINS 1985 · GITTINS 1979</span>
+  </footer>
+</div>
+</body>
+</html>

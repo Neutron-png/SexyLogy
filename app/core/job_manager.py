@@ -535,7 +535,7 @@ class ScrapeJobWorker(QObject):
         proxy = self.options.proxy
         if proxy.mode in ("list", "rotating") and len(self._proxy_pool) > 1:
             if self._brain is not None and self.options.use_identity_memory:
-                proxy.proxies = [self._brain.pick(self._identity_pool(), brain_mod.host_of(url))]
+                proxy.proxies = [self._brain.pick(self._identity_pool(), brain_mod.host_of(url), self.options.identity_selection)]
             else:
                 if self._rotator is None:
                     self._rotator = anonymity.CyclicProxyRotator(self._proxy_pool)
@@ -547,7 +547,7 @@ class ScrapeJobWorker(QObject):
                 pool = self._build_hybrid_pool()
                 if len(pool) > 1:
                     if self._brain is not None and self.options.use_identity_memory:
-                        proxy.proxies = [self._brain.pick(pool, brain_mod.host_of(url))]
+                        proxy.proxies = [self._brain.pick(pool, brain_mod.host_of(url), self.options.identity_selection)]
                     else:
                         if self._rotator is None or len(self._rotator) != len(pool):
                             self._rotator = anonymity.CyclicProxyRotator(pool)

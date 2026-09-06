@@ -207,16 +207,23 @@ class Brain:
             self._domains[stat.host] = stat
         return stat
 
-    def pick(self, pool: list[str], host: str) -> str:
+    def pick(self, pool: list[str], host: str, mode: str = "sticky") -> str:
         """Weighted, cooldown-aware, sticky-aware identity choice.
 
-        - cooled identities (blocked_until in the future) are excluded; if
-          EVERYTHING is cooled we take the one whose bench time ends first
-          rather than pick nothing.
-        - with probability STICKINESS the domain's known identity is reused
-          when still eligible (humans don't re-IP mid-session).
-        - otherwise proportional sampling on (1 − block_prob): a 95%-clean
-          identity carries ~10× the load of a 50% one."""
+        Three selection modes (see ScrapeOptions.identity_selection):
+        - "sticky"   (default): with probability STICKINESS reuse the
+          domain's known-good identity, otherwise posterior-weighted
+          sampling. The human-shaped default.
+        - "weighted": pure posterior-weighted sampling, no stickiness.
+        - "ucb1":     optimistic selection — UCB1 from the bandit
+          literature (Auer et al. 2002). score(i) = mean_i +
+          sqrt(2 ln T / n_i): uncertain identities get an exploration
+          bonus that decays logarithmically as evidence accumulates.
+          Provably optimal up to constants against stationary targets.
+
+        - cooled identities (blocked_until in the future) are excluded in
+          every mode; if EVERYTHING is cooled we take the one whose bench
+          time ends first rather than pick nothing."""
         if not pool:
             raise ValueError("empty identity pool")
         eligible = [k for k in pool if self.identity(k).free]
@@ -225,12 +232,38 @@ class Brain:
             eligible = sorted(pool, key=lambda k: self.identity(k).blocked_until)
             return eligible[0]
 
+        if mode == "ucb1":
+            return self._pick_ucb1(eligible)
+
+        if mode != "sticky":
+            weights = [(1.0 - self.identity(k).block_prob) for k in eligible]
+            return random.choices(eligible, weights=weights, k=1)[0]
+
         sticky_key = self._sticky.get(host)
         if sticky_key and sticky_key in eligible and random.random() < self.STICKINESS:
             return sticky_key
 
         weights = [(1.0 - self.identity(k).block_prob) for k in eligible]
         return random.choices(eligible, weights=weights, k=1)[0]
+
+    def _pick_ucb1(self, eligible: list[str]) -> str:
+        """UCB1 (Auer et al. 2002). score(i) = mean_i + sqrt(2 ln T / n_i)
+        — the empirical mean (exploitation) plus an optimism bonus that
+        rewards uncertainty (exploration) and decays as ln(T)/n_i.
+        Untried identities (n_i = 0) are played first, per the algorithm's
+        initialization phase — an unmeasured arm is the biggest unknown."""
+        plays = {k: (self.identity(k).successes + self.identity(k).blocks) for k in eligible}
+        untried = [k for k in eligible if plays[k] == 0]
+        if untried:
+            return random.choice(untried)
+        total = sum(plays.values())
+
+        def score(k: str) -> float:
+            s = self.identity(k)
+            mean = s.successes / (s.successes + s.blocks)
+            return mean + math.sqrt(2.0 * math.log(total) / plays[k])
+
+        return max(eligible, key=score)
 
     # ---------------- outcome recording ----------------
     def record(self, key: str, host: str, blocked: bool, latency_s: float = 0.0):

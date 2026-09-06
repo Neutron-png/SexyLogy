@@ -171,6 +171,14 @@ class ScrapeOptions:
     # identities, deterministic per-identity personas. Persisted in
     # logy.db so later jobs inherit everything this job learned.
     use_identity_memory: bool = True
+    # Selection policy among identities when identity memory is on:
+    # "sticky"   = default: 70% reuse the domain's known-good identity,
+    #              else posterior-weighted sampling (human-shaped)
+    # "weighted" = pure posterior-weighted sampling, no stickiness
+    # "ucb1"     = UCB1 (Auer et al. 2002): mean + sqrt(2 ln T / n_i) —
+    #              optimism under uncertainty; provably optimal up to
+    #              constants against stationary targets. Most exploratory.
+    identity_selection: str = "sticky"
     # Response cache for FAST_HTTP: ETag/Last-Modified conditional requests;
     # fresh entries return without touching the network at all.
     use_response_cache: bool = False
