@@ -210,6 +210,104 @@ def test_export_dispatch_unknown_format_raises():
         pass
 
 
+def test_export_odoo_xlsx_extra_fields_generalizes_beyond_channel():
+    """'Review for any other required fields Odoo might demand depending
+    on system config' - Channel was the first custom-required field this
+    codebase hit, but any Odoo install can require others (Source, Sales
+    Team, ...). `extra_fields` generalizes the old single `channel_value`
+    kwarg into an arbitrary list of {column, value, aliases} - same
+    precedence rules (a lead's own scraped field wins over the fixed
+    fallback), just not limited to one hardcoded column anymore."""
+    from openpyxl import load_workbook
+    from app.core.exports.exporter import ODOO_STANDARD_COLUMNS
+
+    extra = [
+        {"column": "Channel", "value": "Website", "aliases": ("channel",)},
+        {"column": "Source", "value": "Referral"},  # no aliases -> defaults to "source"
+        {"column": "Sales Team", "value": "Website Team", "aliases": ("sales_team", "team")},
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "extra.xlsx"
+        rows = [
+            {
+                "job_id": 1, "source_url": "https://x.com/1", "scraped_at": 1.0,
+                "data_json": json.dumps({"name": "Lead A", "source": "Google Ads"}),
+            },
+            {
+                "job_id": 1, "source_url": "https://x.com/2", "scraped_at": 2.0,
+                "data_json": json.dumps({"name": "Lead B"}),
+            },
+        ]
+        count = exporter.export_odoo_xlsx(rows, dest, extra_fields=extra)
+        assert count == 2
+
+        wb = load_workbook(dest)
+        ws = wb["Template"]
+        header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        assert header == ODOO_STANDARD_COLUMNS + ["Channel", "Source", "Sales Team"]
+
+        row1 = [c.value for c in next(ws.iter_rows(min_row=2, max_row=2))]
+        # Lead A has its own "source" field -> wins over the fixed "Referral"
+        assert row1[header.index("Source")] == "Google Ads"
+        assert row1[header.index("Channel")] == "Website"
+        assert row1[header.index("Sales Team")] == "Website Team"
+
+        row2 = [c.value for c in next(ws.iter_rows(min_row=3, max_row=3))]
+        # Lead B has no "source" field -> falls back to the fixed value
+        assert row2[header.index("Source")] == "Referral"
+
+
+def test_export_odoo_xlsx_extra_fields_empty_list_means_no_extra_columns():
+    from openpyxl import load_workbook
+    from app.core.exports.exporter import ODOO_STANDARD_COLUMNS
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "no_extra.xlsx"
+        exporter.export_odoo_xlsx(ODOO_SAMPLE_ROWS, dest, extra_fields=[])
+        ws = load_workbook(dest)["Template"]
+        header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        assert header == ODOO_STANDARD_COLUMNS
+
+
+def test_export_dispatch_passes_extra_fields_kwarg_to_odoo_exporter():
+    from openpyxl import load_workbook
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "out.xlsx"
+        extra = [{"column": "Priority", "value": "High"}]
+        exporter.export("odoo_xlsx", ODOO_SAMPLE_ROWS, dest, extra_fields=extra)
+        ws = load_workbook(dest)["Template"]
+        header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        assert header[-1] == "Priority"
+        row1 = [c.value for c in next(ws.iter_rows(min_row=2, max_row=2))]
+        assert row1[-1] == "High"
+
+
+def test_extra_fields_from_settings_migrates_legacy_channel_value():
+    """A user who set 'Channel value' before extra_fields existed must not
+    silently lose it - extra_fields_from_settings() should synthesize the
+    same single-Channel list the old code always used."""
+    store = {"odoo_channel_value": "Cold Call"}
+    fields = exporter.extra_fields_from_settings(lambda k, d=None: store.get(k, d))
+    assert fields == [{"column": "Channel", "value": "Cold Call",
+                        "aliases": ["channel", "lead_channel", "source_channel"]}]
+
+
+def test_extra_fields_from_settings_prefers_new_setting_over_legacy():
+    store = {
+        "odoo_channel_value": "Cold Call",  # should be ignored once the new setting exists
+        "odoo_extra_fields": [{"column": "Source", "value": "Website"}],
+    }
+    fields = exporter.extra_fields_from_settings(lambda k, d=None: store.get(k, d))
+    assert fields == [{"column": "Source", "value": "Website"}]
+
+
+def test_extra_fields_from_settings_defaults_to_channel_when_nothing_configured():
+    fields = exporter.extra_fields_from_settings(lambda k, d=None: d)
+    assert fields == exporter.DEFAULT_ODOO_EXTRA_FIELDS
+
+
 def test_export_progress_callback_called():
     calls = []
     with tempfile.TemporaryDirectory() as tmp:

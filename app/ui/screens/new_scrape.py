@@ -17,9 +17,9 @@ from app.core.engine.nl_to_fields import generate_fields
 from app.core.engine.ai_extractor import DEFAULT_FIELD_NAMES as DEFAULT_AI_FIELDS
 from app.core.engine import scrapling_adapter as engine
 from app.core.engine.builtin_templates import (
-    generate_niche_urls, generate_niche_urls_yelp, generate_niche_urls_all_sources,
-    RESULTS_PER_PAGE, YELP_RESULTS_PER_PAGE, YELP_CONTAINER, YELP_DETAIL_CONFIG,
-    ICP_NICHES, CITY_POOL, MAX_URLS_ALL_CITIES,
+    generate_niche_urls_per_city,
+    YELP_CONTAINER, YELP_DETAIL_CONFIG,
+    ICP_NICHES, CITY_POOL,
     get_all_source_profiles,
 )
 from app.core.exports import exporter
@@ -190,32 +190,35 @@ class NewScrapeScreen(QWidget):
         row.addWidget(apply_btn)
         layout.addLayout(row)
 
-        # "عايز الف ولا الفين" - let the user say how many leads they want
-        # instead of a hard-coded 2-city, ~50-lead default. LOGY pages
-        # through yellowpages.com (&page=2, &page=3, ...) across more
-        # cities to cover it - see generate_niche_urls() in
-        # app/core/engine/builtin_templates.py for exactly how the URL
-        # list is sized from this number.
+        # "بيطلع 10 url بس للمدن كلها! عايز لكل مدينة لوحدها 2000 URL" -
+        # this used to be "How many leads (approx.)": one GLOBAL number
+        # split three ways across yellowpages/Yelp/thumbtack and then
+        # spread breadth-first across the WHOLE city list, so a modest
+        # value divided down to a handful of URLs per source - and
+        # thumbtack (one URL per city, no pagination for its page type)
+        # exhausted its whole share after roughly the first 10 cities.
+        # That's exactly the "10 URLs total, no matter how many cities"
+        # bug report.
+        #
+        # It's now a PER-CITY budget instead - see
+        # generate_niche_urls_per_city() in
+        # app/core/engine/builtin_templates.py: every selected city gets
+        # its OWN shot at up to this many URLs (combining all 3 sources),
+        # independent of every other city, instead of sharing one pool.
         target_row = QHBoxLayout()
-        target_row.addWidget(QLabel("How many leads (approx.):"))
+        target_row.addWidget(QLabel("URLs per city (all sources combined):"))
         self.target_results_spin = QSpinBox()
-        # Ceiling matches generate_niche_urls()'s own ceiling
-        # (MAX_URLS_ALL_CITIES = all 100 cities x MAX_PAGES_PER_CITY pages
-        # x RESULTS_PER_PAGE/page) - raising the spinbox past what the
-        # generator can ever actually produce would just silently cap
-        # back down with no explanation, which is exactly the "عايزة
-        # يسيرش التوب 100 مدينة" complaint in a different shape.
-        self.target_results_spin.setRange(RESULTS_PER_PAGE, MAX_URLS_ALL_CITIES * RESULTS_PER_PAGE)
-        self.target_results_spin.setSingleStep(RESULTS_PER_PAGE)
-        # 6000 is the smallest value that reaches ALL top 100 cities' page
-        # 1 in EVERY mode by default, including "All Sources" (which
-        # splits this number in half between yellowpages/Yelp before each
-        # source converts its own half to a page count - halving anything
-        # below 6000 would leave yellowpages short of all 100 cities).
-        # "عايزة يسيرش التوب 100 مدينة" shouldn't require the user to
-        # already know that math just to get full coverage on the first
-        # try.
-        self.target_results_spin.setValue(6000)
+        # Ceiling is generate_niche_urls_per_city()'s own deep-paging
+        # ceiling (DEEP_MAX_PAGES_PER_SOURCE, YP+Yelp alternating, plus
+        # thumbtack's fixed 1) - raising the spinbox past what the
+        # generator can ever actually produce per city would just
+        # silently cap back down with no explanation.
+        self.target_results_spin.setRange(1, 2001)
+        self.target_results_spin.setSingleStep(50)
+        # 2000 matches the "عايز لكل مدينة لوحدها 2000 URL" ask directly -
+        # full coverage of every selected city's own 2000-URL budget by
+        # default, no math required to get there.
+        self.target_results_spin.setValue(2000)
         target_row.addWidget(self.target_results_spin)
 
         # "خليني اقدر احدد المدن اللي محتاجها و بالتالي دا ينطبق على
@@ -247,10 +250,12 @@ class NewScrapeScreen(QWidget):
         self._update_cities_summary()
 
         target_hint = QLabel(
-            f"(LOGY covers every city's first page before paging deeper into any one city - set this "
-            f"to ~{len(CITY_POOL) * RESULTS_PER_PAGE} to reach all top {len(CITY_POOL)} cities at least "
-            "once, or higher to also page deeper into each. Actual count depends on how many real "
-            "businesses exist for this niche.)"
+            "(Applies to EACH selected city separately, not split between them - 2000 here means "
+            "up to 2000 URLs for every single city you've chosen, combining yellowpages.com + "
+            "yelp.com pages + thumbtack.com's one page. No single URL returns more leads than the "
+            "real site's own page size (yellowpages: 30/page, yelp/thumbtack: 10/page) - this "
+            "number controls how many pages deep LOGY goes per city, not leads-per-link. Actual "
+            "totals still depend on how many real businesses exist for this niche in each city.)"
         )
         target_hint.setWordWrap(True)
         target_hint.setStyleSheet("color: #8B95A7; font-size: 11px;")
@@ -487,8 +492,15 @@ class NewScrapeScreen(QWidget):
         self._active_source_profiles = source_profiles
         self._apply_yelp_anti_block_settings()  # this run includes yelp.com URLs too
 
-        target_count = self.target_results_spin.value()
-        start_urls = generate_niche_urls_all_sources(niche_name, target_count, cities=self._collect_cities())
+        # "لكل مدينة لوحدها 2000 URL" - generate_niche_urls_per_city()
+        # gives every selected city its OWN up-to-target_count budget
+        # (see the spinbox's comment above / that function's docstring),
+        # instead of generate_niche_urls_all_sources()' shared global
+        # split which is what produced only ~10 URLs total regardless of
+        # how many cities were selected.
+        urls_per_city = self.target_results_spin.value()
+        cities = self._collect_cities()
+        start_urls = generate_niche_urls_per_city(niche_name, urls_per_city, cities=cities)
         if start_urls:
             self.urls_input.setPlainText("\n".join(start_urls))
             self.max_pages_spin.setValue(max(len(start_urls), self.max_pages_spin.value()))
@@ -498,15 +510,19 @@ class NewScrapeScreen(QWidget):
             yp_count = sum(1 for u in start_urls if "yellowpages.com" in u)
             yelp_count = sum(1 for u in start_urls if "yelp.com" in u)
             thumbtack_count = len(start_urls) - yp_count - yelp_count
+            city_count = len(cities) if cities else len(CITY_POOL)
             self.quick_start_status.setText(
-                f"✓ '{niche_name}' جاهز - {len(start_urls)} رابط بحث ({yp_count} من yellowpages.com + "
+                f"✓ '{niche_name}' جاهز - {len(start_urls)} رابط بحث على {city_count} مدينة (لحد "
+                f"{urls_per_city} رابط لكل مدينة على حدة: {yp_count} من yellowpages.com + "
                 f"{yelp_count} من yelp.com + {thumbtack_count} من thumbtack.com) في نفس القائمة تحت. "
                 "كل رابط هياخد السلكتور بتاعه الصح أوتوماتيك حسب مصدره - مش محتاج تشغلهم واحد واحد ولا "
-                "تدمج نتايجهم بنفسك. ملحوظة: ليدز thumbtack.com هتيجي فيها اسم البيزنس + التقييم + "
-                "لينك بروفايل بس (مفيش تليفون ولا موقع - الموقع نفسه مش بينشرهم للعامة أصلاً)، وبعض "
-                "النيتشات (زي الأطباء/المحامين/وكلاء السيارات) ممكن مايكونش ليها تصنيف حقيقي في "
-                "thumbtack فتطلع صفر ليدز منه بس المصدرين التانيين هيغطوها عادي. دوس Start Scraping "
-                "على طول."
+                "تدمج نتايجهم بنفسك. ملحوظة: ولا رابط من التلاتة هيرجّع 50 ليد لوحده - أعلى حاجة "
+                "yellowpages.com بترجعها فى الصفحة الواحدة هي 30، وyelp/thumbtack بيرجعوا 10 - العدد "
+                "اللي بتحطه فوق بيتحكم في عمق الصفحات لكل مدينة (كام صفحة يدخلها) مش في عدد الليدز في "
+                "اللينك الواحد. ليدز thumbtack.com هتيجي فيها اسم البيزنس + التقييم + لينك بروفايل بس "
+                "(مفيش تليفون ولا موقع - الموقع نفسه مش بينشرهم للعامة أصلاً)، وبعض النيتشات (زي "
+                "الأطباء/المحامين/وكلاء السيارات) ممكن مايكونش ليها تصنيف حقيقي في thumbtack فتطلع صفر "
+                "ليدز منه بس المصدرين التانيين هيغطوها عادي. دوس Start Scraping على طول."
             )
         else:
             self.quick_start_status.setText(
@@ -729,11 +745,14 @@ class NewScrapeScreen(QWidget):
         if source == "yelp":
             self._apply_yelp_anti_block_settings()
 
-        target_count = self.target_results_spin.value()
+        # Same per-city budget as Quick Start's combined flow (see
+        # _apply_all_sources_niche() above / generate_niche_urls_per_city()'s
+        # docstring), just restricted to this ONE source so it gets the
+        # WHOLE per-city budget instead of sharing it with the others.
+        urls_per_city = self.target_results_spin.value()
         cities = self._collect_cities()
-        start_urls = (
-            generate_niche_urls_yelp(niche_name, target_count, cities=cities) if source == "yelp"
-            else generate_niche_urls(niche_name, target_count, cities=cities)
+        start_urls = generate_niche_urls_per_city(
+            niche_name, urls_per_city, cities=cities, sources=(source,),
         )
         if start_urls:
             self.urls_input.setPlainText("\n".join(start_urls))
@@ -1200,16 +1219,62 @@ class NewScrapeScreen(QWidget):
     def _build_proxy_section(self) -> QWidget:
         w, layout = card("Proxy")
         self.proxy_mode_combo = QComboBox()
-        self.proxy_mode_combo.addItems(["No proxy", "Single proxy", "Proxy list", "Rotating"])
+        self.proxy_mode_combo.addItems([
+            "No proxy",
+            "Single proxy",
+            "Proxy list",
+            "Rotating",
+            "Tor (anonymous - through local Tor)",
+            "Hybrid: proxies + Tor (يفتح المواقع اللي بتمنع تور)",
+        ])
         self.proxy_list_input = QPlainTextEdit()
         self.proxy_list_input.setPlaceholderText("http://user:pass@host:port  (one per line)")
         self.proxy_list_input.setFixedHeight(70)
         layout.addWidget(self.proxy_mode_combo)
         layout.addWidget(self.proxy_list_input)
-        note = QLabel("Proxy credentials are encrypted at rest and never written to logs or exports.")
-        note.setStyleSheet("color: #8B95A7; font-size: 11px;")
-        layout.addWidget(note)
+
+        # Tor settings (used only when the Tor mode is selected). Requests
+        # tunnel through 127.0.0.1:<socks port>; every <rotate> requests the
+        # control port is asked for a NEW circuit so the exit IP changes.
+        tor_row = QHBoxLayout()
+        tor_row.addWidget(QLabel("SOCKS port"))
+        self.tor_socks_spin = QSpinBox()
+        self.tor_socks_spin.setRange(1, 65535)
+        self.tor_socks_spin.setValue(9050)
+        tor_row.addWidget(self.tor_socks_spin)
+        tor_row.addWidget(QLabel("Control port"))
+        self.tor_control_spin = QSpinBox()
+        self.tor_control_spin.setRange(1, 65535)
+        self.tor_control_spin.setValue(9051)
+        tor_row.addWidget(self.tor_control_spin)
+        tor_row.addWidget(QLabel("Rotate IP every"))
+        self.tor_rotate_spin = QSpinBox()
+        self.tor_rotate_spin.setRange(0, 1000)
+        self.tor_rotate_spin.setValue(10)
+        self.tor_rotate_spin.setSuffix(" req")
+        tor_row.addWidget(self.tor_rotate_spin)
+        tor_row.addStretch(1)
+        self.tor_row_widget = QWidget()
+        self.tor_row_widget.setLayout(tor_row)
+        self.tor_row_widget.setVisible(False)
+        layout.addWidget(self.tor_row_widget)
+
+        self.proxy_note = QLabel(
+            "Proxy credentials are encrypted at rest and never written to logs or exports.\n"
+            "Tor mode: شغّل Tor Browser (أو tor.exe) قبل التشغيل - كل الريكويستات هتعدي على شبكة Tor "
+            "والـ IP هيتغير تلقائياً كل فترة. المواقع مش هتشوف الـ IP الحقيقي.\n"
+            "Hybrid mode: البروكسيات بتاعتك + Tor في نفس التناوب - لما موقع يبلوك هوية (403/Cloudflare) "
+            "الريكويست الجاي يطلع من هوية تانية غير مبلوكة. ده اللي بيفتح المواقع اللي بتمنع Tor exit nodes."
+        )
+        self.proxy_note.setStyleSheet("color: #8B95A7; font-size: 11px;")
+        layout.addWidget(self.proxy_note)
+        self.proxy_mode_combo.currentIndexChanged.connect(self._on_proxy_mode_changed)
         return w
+
+    def _on_proxy_mode_changed(self, index: int):
+        is_tor = index in (4, 5)
+        self.tor_row_widget.setVisible(is_tor)
+        self.proxy_list_input.setVisible(index not in (0, 4))
 
     # ------------------------------------------------------------------
     # LIVE RUN PANEL
@@ -1353,9 +1418,9 @@ class NewScrapeScreen(QWidget):
                 k, v = line.split("=", 1)
                 cookies[k.strip()] = v.strip()
 
-        proxy_mode_map = {0: "none", 1: "single", 2: "list", 3: "rotating"}
+        proxy_mode_map = {0: "none", 1: "single", 2: "list", 3: "rotating", 4: "tor", 5: "hybrid"}
         proxy_mode = proxy_mode_map[self.proxy_mode_combo.currentIndex()]
-        proxies = [p.strip() for p in self.proxy_list_input.toPlainText().splitlines() if p.strip()]
+        proxies = [] if proxy_mode in ("tor",) else [p.strip() for p in self.proxy_list_input.toPlainText().splitlines() if p.strip()]
 
         return ScrapeOptions(
             fetcher_mode=self.fetcher_combo.currentData(),
@@ -1369,7 +1434,13 @@ class NewScrapeScreen(QWidget):
             disable_resources=self.disable_resources_chk.isChecked(),
             headers=headers,
             cookies=cookies,
-            proxy=ProxyConfig(mode=proxy_mode, proxies=proxies),
+            proxy=ProxyConfig(
+                mode=proxy_mode,
+                proxies=proxies,
+                tor_socks_port=self.tor_socks_spin.value(),
+                tor_control_port=self.tor_control_spin.value(),
+                tor_rotate_every=self.tor_rotate_spin.value(),
+            ),
             auto_qualify_leads=self.auto_qualify_chk.isChecked(),
             ai_extraction=self._collect_ai_extraction() or AIExtractionConfig(enabled=False),
             owner_lookup_enabled=self.owner_lookup_chk.isChecked(),
@@ -1404,7 +1475,13 @@ class NewScrapeScreen(QWidget):
     def _options_to_dict(self, options: ScrapeOptions) -> dict:
         d = dict(options.__dict__)
         d["fetcher_mode"] = options.fetcher_mode.value
-        d["proxy"] = {"mode": options.proxy.mode, "proxies": options.proxy.proxies}
+        d["proxy"] = {
+            "mode": options.proxy.mode,
+            "proxies": options.proxy.proxies,
+            "tor_socks_port": options.proxy.tor_socks_port,
+            "tor_control_port": options.proxy.tor_control_port,
+            "tor_rotate_every": options.proxy.tor_rotate_every,
+        }
         d["ai_extraction"] = {
             "enabled": options.ai_extraction.enabled,
             "field_names": options.ai_extraction.field_names,
@@ -1556,15 +1633,18 @@ class NewScrapeScreen(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Export results", default_name, f"*.{extension}")
         if not path:
             return
-        # Both odoo_* formats' "Channel" column is a required field only
-        # on THIS user's own Odoo instance (not part of Odoo's stock
-        # crm.lead import template - see exporter.py's
-        # DEFAULT_ODOO_CHANNEL_VALUE docstring) - its value comes from
-        # Settings -> "Odoo Export" (db setting "odoo_channel_value"),
-        # never guessed here.
+        # Both odoo_* formats can carry extra required columns (Channel,
+        # Source, Sales Team, ...) that are required only on THIS user's
+        # own Odoo instance, not part of Odoo's stock crm.lead import
+        # template - see exporter.py's extra_fields_from_settings()
+        # docstring. Configured from Settings -> "Odoo Export"'s table (db
+        # setting "odoo_extra_fields"); never guessed here. Reads through
+        # the same helper Settings uses so a value set there before this
+        # export runs (or a still-unmigrated legacy "odoo_channel_value")
+        # is picked up identically in both places.
         extra_kwargs = {}
         if fmt in ODOO_EXTENSIONS:
-            extra_kwargs["channel_value"] = self.db.get_setting("odoo_channel_value", exporter.DEFAULT_ODOO_CHANNEL_VALUE)
+            extra_kwargs["extra_fields"] = exporter.extra_fields_from_settings(self.db.get_setting)
         try:
             count = exporter.export(fmt, self.db.iter_all_results(self.current_job_id), path, **extra_kwargs)
             QMessageBox.information(self, "Export", f"تم تصدير {count} سجل إلى:\n{path}")

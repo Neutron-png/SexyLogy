@@ -82,8 +82,29 @@ class TargetConfig:
 
 @dataclass
 class ProxyConfig:
-    mode: str = "none"                 # "none" | "single" | "list" | "rotating"
+    # "none" | "single" | "list" | "rotating" | "tor" | "hybrid"
+    # "tor" routes every request through a locally-running Tor SOCKS proxy
+    # (127.0.0.1:tor_socks_port) and periodically asks Tor's control port
+    # for a NEW CIRCUIT (NEWNYM) so the exit IP changes mid-run - see
+    # app/core/engine/anonymity.py. Note: websites never see a MAC address
+    # (it's layer-2, dies at the first router), so IP rotation via proxies/
+    # Tor is the only real anonymity lever for web scraping.
+    # "hybrid" is the answer for sites that BLOCK TOR: user proxies and the
+    # Tor endpoint share one rotation pool, and any identity that gets
+    # blocked (403/429/Cloudflare...) is skipped on the next request -
+    # see job_manager._fetch_with_retries().
+    mode: str = "none"
     proxies: list[str] = field(default_factory=list)  # never logged/exported raw
+    # --- Tor (only read when mode == "tor") ---
+    tor_socks_port: int = 9050         # Tor's SOCKS5 listener
+    tor_control_port: int = 9051       # Tor's control port (for NEWNYM rotation)
+    # Rotate the Tor circuit (new exit IP) every N requests. 0 = never
+    # rotate - one exit IP for the whole job.
+    tor_rotate_every: int = 10
+    # Optional control-port password. Cookie auth (Tor's control_auth_cookie
+    # file) is tried first; this is the fallback for
+    # HashedControlPassword setups. Never logged/exported.
+    tor_control_password: str = ""
 
 
 @dataclass

@@ -14,7 +14,7 @@ from app.core.engine.builtin_templates import (
     BUILTIN_TEMPLATES, seed_builtin_templates, generate_niche_urls, generate_niche_urls_yelp,
     NICHE_SEARCH_TERMS, CITY_POOL, RESULTS_PER_PAGE, YELP_RESULTS_PER_PAGE, MAX_PAGES_PER_CITY,
     resolve_cities, generate_niche_urls_all_sources, SOURCE_PROFILES, get_all_source_profiles,
-    generate_niche_urls_thumbtack,
+    generate_niche_urls_thumbtack, generate_niche_urls_per_city,
 )
 
 
@@ -290,6 +290,75 @@ def test_generate_niche_urls_thumbtack_skips_cities_without_state():
     name = next(iter(NICHE_SEARCH_TERMS))
     urls = generate_niche_urls_thumbtack(name, target_results=50, cities=[("Cairo", "")])
     assert urls == []
+
+
+# --- per-city budget ("بيطلع 10 url بس للمدن كلها! عايز لكل مدينة
+# لوحدها 2000 URL") ---
+
+def test_generate_niche_urls_per_city_gives_every_city_its_own_full_budget():
+    """The bug: generate_niche_urls_all_sources() shares ONE global
+    target across the whole city list, so a modest target (or thumbtack's
+    1-URL-per-city cap) starves most cities down to nothing. Each of N
+    selected cities here must independently get up to urls_per_city URLs
+    - not urls_per_city SHARED across all of them."""
+    name = next(iter(NICHE_SEARCH_TERMS))
+    cities = [("Austin", "TX"), ("Miami", "FL"), ("Chicago", "IL")]
+    urls = generate_niche_urls_per_city(name, urls_per_city=25, cities=cities)
+
+    # Single-word city names in this test - a plain lowercase substring
+    # check is unambiguous across all three sources' differing URL
+    # encodings (thumbtack.com/tx/austin/..., yellowpages ?geo_location_
+    # terms=Austin%2C+TX, yelp find_loc=Austin%2C+TX).
+    per_city_counts = {city: sum(1 for u in urls if city.lower() in u.lower()) for city, _ in cities}
+    # Every city reaches (close to) the full 25-URL budget on its own -
+    # none of them starved because another city used up a shared pool.
+    assert all(count >= 20 for count in per_city_counts.values()), per_city_counts
+    assert len(urls) >= 3 * 20
+
+
+def test_generate_niche_urls_per_city_caps_at_exactly_the_budget_per_city():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    cities = [("Austin", "TX"), ("Miami", "FL")]
+    urls = generate_niche_urls_per_city(name, urls_per_city=7, cities=cities)
+    # 2 cities x 7 URLs each = 14 total, never more per city than asked.
+    assert len(urls) == 14
+
+
+def test_generate_niche_urls_per_city_includes_all_three_sources_when_budget_allows():
+    name = next(iter(NICHE_SEARCH_TERMS))
+    urls = generate_niche_urls_per_city(name, urls_per_city=50, cities=[("Austin", "TX")])
+    domains = {"yellowpages.com": False, "yelp.com": False, "thumbtack.com": False}
+    for u in urls:
+        for d in domains:
+            if d in u:
+                domains[d] = True
+    assert all(domains.values()), domains
+
+
+def test_generate_niche_urls_per_city_thumbtack_still_capped_at_one_per_city():
+    """Thumbtack's page has no known pagination (a fixed "Top 10" list -
+    see THUMBTACK_RESULTS_PER_PAGE) - even a large per-city budget must
+    not invent extra thumbtack URLs that don't exist."""
+    name = next(iter(NICHE_SEARCH_TERMS))
+    urls = generate_niche_urls_per_city(name, urls_per_city=500, cities=[("Austin", "TX")])
+    thumbtack_urls = [u for u in urls if "thumbtack.com" in u]
+    assert len(thumbtack_urls) == 1
+
+
+def test_generate_niche_urls_per_city_single_source_gets_the_whole_budget():
+    """new_scrape.py's single-source 'Load ... Search Links' buttons pass
+    sources=("yellowpages",) (or "yelp") so that ONE source gets the full
+    per-city budget instead of splitting it with the others."""
+    name = next(iter(NICHE_SEARCH_TERMS))
+    urls = generate_niche_urls_per_city(
+        name, urls_per_city=12, cities=[("Austin", "TX")], sources=("yellowpages",),
+    )
+    assert len(urls) == 12
+    assert all("yellowpages.com" in u for u in urls)
+
+
+def test_generate_niche_urls_per_city_unknown_niche_returns_empty():
+    assert generate_niche_urls_per_city("Not A Real Niche", urls_per_city=100) == []
 
 
 def test_generate_niche_urls_no_cities_arg_uses_full_pool_unchanged():

@@ -1,16 +1,15 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
-venv/
-.env
-*.log
+*.egg-info/
 
-# Scrape/export output - these are DATA a user generates by running LOGY,
-# not part of the app itself, so they don't belong in version control
-# (also avoids repeatedly committing megabytes of scraped leads).
-*.xlsx
-*.csv
-*.jsonl
-results*.csv
-crm_leads*.xlsx
+# App data
 logy.db
+*.db-journal
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

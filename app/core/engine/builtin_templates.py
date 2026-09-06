@@ -607,6 +607,111 @@ def generate_niche_urls_all_sources(
     return yp_urls + yelp_urls + thumbtack_urls
 
 
+# "عايز يجمع 2000 لينك لكل مدينة (كل ال3 مصادر مع بعض)" - the ORIGINAL
+# combined generator above (generate_niche_urls_all_sources) treats its
+# `target_results` as one GLOBAL number, split three ways and then spread
+# BREADTH-FIRST ACROSS EVERY CITY - so a modest target divides into a
+# small handful of URLs per source, and thumbtack (ONE URL per city, no
+# known pagination for its page type - see THUMBTACK_RESULTS_PER_PAGE)
+# exhausts its whole share after roughly the first 10 cities. That is
+# exactly the "بيطلع 10 url بس للمدن كلها" bug report: the budget was
+# shared across the whole city list instead of belonging to each city.
+#
+# generate_niche_urls_per_city() below inverts that: the budget belongs
+# to EACH selected city independently, spent depth-first within that one
+# city across all three sources, before moving to the next - so every
+# city gets its own shot at up to `urls_per_city` URLs regardless of how
+# many other cities are selected.
+#
+# Reaching a couple thousand URLs for ONE city needs deeper per-source
+# paging than MAX_PAGES_PER_CITY (300) allows on its own - this is a
+# SEPARATE, larger ceiling used only by this deep-per-city path. Same
+# safety argument as MAX_PAGES_PER_CITY's own docstring above (the
+# lead-history de-dup layer makes over-paging cost only fetch time, not
+# bad data), just extended further since a per-city target this high is
+# an explicit ask for that depth.
+DEEP_MAX_PAGES_PER_SOURCE = 1000
+
+
+def generate_niche_urls_per_city(
+    niche_name: str, urls_per_city: int = 2000,
+    cities: list[tuple[str, str]] | None = None,
+    max_pages_per_source: int = DEEP_MAX_PAGES_PER_SOURCE,
+    sources: tuple[str, ...] = ("thumbtack", "yellowpages", "yelp"),
+) -> list[str]:
+    """Builds up to `urls_per_city` URLs for EACH selected city
+    independently (see the module note above for how this differs from
+    generate_niche_urls_all_sources()'s shared/global budget), combining
+    the sources listed in `sources` (any of "thumbtack" / "yellowpages" /
+    "yelp", default all three): thumbtack.com's one city+niche page (if
+    included), then yellowpages.com and yelp.com pages alternating (YP
+    page 1, Yelp page 1, YP page 2, Yelp page 2, ...) until either
+    `urls_per_city` is reached for that city or every included source has
+    been paged `max_pages_per_source` deep. Restricting `sources` to a
+    single one (e.g. `("yellowpages",)`) gives that ONE source the WHOLE
+    `urls_per_city` budget per city instead of sharing it with the
+    others - what new_scrape.py's single-source "Load ... Search Links"
+    buttons use, versus Quick Start's default all-three call.
+
+    Cities are processed in `cities`/CITY_POOL order and concatenated -
+    the result is NOT interleaved across cities (contrast
+    generate_niche_urls()'s breadth-first-across-cities order), since
+    each city's budget is independent here; nothing downstream needs
+    city A's page 1 before city B's page 1 anymore.
+
+    IMPORTANT ceiling on "at least N leads per URL": each source's page
+    size is fixed by the real site, not something LOGY controls -
+    yellowpages.com returns up to RESULTS_PER_PAGE (30) leads per URL,
+    yelp.com up to YELP_RESULTS_PER_PAGE (10), thumbtack.com a fixed 10
+    (its page is a static "Top 10 in <City>" list - see
+    THUMBTACK_RESULTS_PER_PAGE's docstring; there is no thumbtack URL
+    that returns more). No single URL from any of the three will ever
+    return 50 leads by itself - going DEEP across many pages/URLs per
+    city is the only real lever for raising a city's total lead count,
+    not asking for wider pages that don't exist.
+
+    Real availability is still the actual ceiling, same caveat as every
+    other generator in this module: most city+niche combinations don't
+    have anywhere near 2000 real distinct results per source, so a run
+    configured this deep will spend a lot of its later fetches on pages
+    past the real end of that city's listings. That's expected, not a
+    bug - LOGY's lead-history de-dup (db.py's lead_history table) makes
+    it safe rather than silently duplicating records, at the cost of
+    extra fetch time only."""
+    term = NICHE_SEARCH_TERMS.get(niche_name)
+    if not term:
+        return []
+    pool = cities if cities else CITY_POOL
+    use_thumbtack = "thumbtack" in sources
+    use_yp = "yellowpages" in sources
+    use_yelp = "yelp" in sources
+
+    all_urls: list[str] = []
+    for city, state in pool:
+        city_urls: list[str] = []
+
+        if use_thumbtack:
+            tt_url = _thumbtack_url(term, city, state)
+            if tt_url and len(city_urls) < urls_per_city:
+                city_urls.append(tt_url)
+
+        for page_i in range(max_pages_per_source):
+            if len(city_urls) >= urls_per_city:
+                break
+            if use_yp:
+                city_urls.append(_yp_search_url(term, city, state, page=page_i + 1))
+                if len(city_urls) >= urls_per_city:
+                    break
+            if use_yelp:
+                city_urls.append(_yelp_search_url(term, city, state, start=page_i * YELP_RESULTS_PER_PAGE))
+            if not use_yp and not use_yelp:
+                break  # thumbtack-only: nothing left to page
+
+        all_urls.extend(city_urls[:urls_per_city])
+
+    return all_urls
+
+
 BUILTIN_TEMPLATES: list[dict] = [
     {
         "name": f"SEO Leads - {niche}",

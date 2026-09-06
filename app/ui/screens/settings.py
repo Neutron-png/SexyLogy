@@ -6,11 +6,12 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit, QPushButton,
     QCheckBox, QSpinBox, QFormLayout, QFileDialog, QMessageBox, QTabWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
 
 from app.core.storage.db import Database
 from app.core.engine import scrapling_adapter as engine
-from app.core.exports.exporter import DEFAULT_ODOO_CHANNEL_VALUE
+from app.core.exports.exporter import extra_fields_from_settings
 
 
 class SettingsScreen(QWidget):
@@ -89,33 +90,92 @@ class SettingsScreen(QWidget):
         return w
 
     def _odoo_export_tab(self) -> QWidget:
-        # "Channel" is a required field only on THIS user's own Odoo
-        # instance, not part of Odoo's stock crm.lead import template -
-        # LOGY has no way to know what values it accepts (it's a custom
-        # field), so it's a single value the user types once here instead
-        # of a guess baked into the exporter (see exporter.py's
-        # DEFAULT_ODOO_CHANNEL_VALUE / _lead_row_for_odoo()). Applied to
-        # EVERY lead in an "Odoo CRM Lead template (.xlsx)" export unless
-        # that lead's own scraped data already has a "channel" field.
+        # Different Odoo installs require different EXTRA fields beyond
+        # the stock crm.lead import template - an admin can mark any
+        # field required via Studio, a mandatory Sales Team, multi-company
+        # setups, etc. LOGY can't guess any of these correctly (a wrong
+        # guess corrupts the import same as a missing value), so this is
+        # an open-ended table instead of one hardcoded "Channel" box:
+        # add one row per field Odoo's own import error names (e.g.
+        # "Missing required value for the field Channel"), with the exact
+        # column name and the fixed value your instance expects. Applied
+        # to every lead in an "Odoo CRM Lead template" export unless that
+        # lead's own scraped data already has a matching field of its own
+        # (see exporter.py's extra_fields_from_settings() / DEFAULT_ODOO_EXTRA_FIELDS
+        # for the full precedence rules and a list of commonly-required ones).
         w = QWidget()
         layout = QVBoxLayout(w)
         note = QLabel(
-            "لو ملف الأودو بتاعك محتاج قيمة إجبارية لحقل 'Channel' مش موجودة في بيانات الليدز نفسها "
-            "(زي 'Missing required value for the field Channel')، حط هنا القيمة اللي هتتحط تلقائي لكل "
-            "ليد بيتصدّر بصيغة 'Odoo CRM Lead template' - لازم تكون مكتوبة بالظبط زي ما هي موجودة "
-            "عندك في أودو (مثلاً اسم قناة من قايمة الـ Channels بتاعتك)."
+            "أي حقل إجباري (required) في أودو بتاعك مش موجود في القالب القياسي - زي "
+            "Channel أو Source أو Sales Team - ضيفه هنا: اسم العمود زي ما هو مكتوب في "
+            "رسالة الخطأ بتاعة أودو (مثلاً 'Missing required value for the field Channel')، "
+            "والقيمة الثابتة اللي المفروض تتحط لكل ليد. لو الليد نفسه عنده حقل بنفس "
+            "الاسم من الأصل (من البيانات اللي اتجمعت)، القيمة بتاعته هي اللي بتتاخد."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #8B95A7; font-size: 11px;")
         layout.addWidget(note)
 
-        form = QFormLayout()
-        channel_value = QLineEdit(self.db.get_setting("odoo_channel_value", DEFAULT_ODOO_CHANNEL_VALUE))
-        channel_value.textChanged.connect(lambda v: self.db.set_setting("odoo_channel_value", v))
-        form.addRow("Channel value", channel_value)
-        layout.addLayout(form)
+        self._odoo_fields_state: list[dict] = extra_fields_from_settings(self.db.get_setting)
+
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Odoo Column", "Fixed Value"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        self._odoo_fields_table = table
+        layout.addWidget(table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ Add Field")
+        add_btn.clicked.connect(self._add_odoo_field_row)
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(self._remove_odoo_field_row)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
         layout.addStretch(1)
+
+        self._render_odoo_fields_table()
+        table.itemChanged.connect(self._save_odoo_fields_table)
         return w
+
+    def _render_odoo_fields_table(self):
+        table = self._odoo_fields_table
+        table.blockSignals(True)
+        table.setRowCount(len(self._odoo_fields_state))
+        for row, field in enumerate(self._odoo_fields_state):
+            table.setItem(row, 0, QTableWidgetItem(str(field.get("column", ""))))
+            table.setItem(row, 1, QTableWidgetItem(str(field.get("value", ""))))
+        table.blockSignals(False)
+
+    def _add_odoo_field_row(self):
+        self._odoo_fields_state.append({"column": "", "value": "", "aliases": None})
+        self._render_odoo_fields_table()
+
+    def _remove_odoo_field_row(self):
+        rows = sorted({i.row() for i in self._odoo_fields_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        for r in rows:
+            if 0 <= r < len(self._odoo_fields_state):
+                del self._odoo_fields_state[r]
+        self._render_odoo_fields_table()
+        self._save_odoo_fields_table()
+
+    def _save_odoo_fields_table(self, *_args):
+        table = self._odoo_fields_table
+        for row in range(min(table.rowCount(), len(self._odoo_fields_state))):
+            col_item = table.item(row, 0)
+            val_item = table.item(row, 1)
+            self._odoo_fields_state[row]["column"] = (col_item.text().strip() if col_item else "")
+            self._odoo_fields_state[row]["value"] = (val_item.text() if val_item else "")
+        # Rows with no column name yet (e.g. right after "+ Add Field",
+        # before the user types one) are dropped rather than persisted -
+        # an empty-string Odoo column header would corrupt the export.
+        cleaned = [f for f in self._odoo_fields_state if f.get("column")]
+        self.db.set_setting("odoo_extra_fields", cleaned)
 
     def _browser_tab(self) -> QWidget:
         w = QWidget()

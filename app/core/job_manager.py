@@ -23,6 +23,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from app.core.engine import scrapling_adapter as engine
 from app.core.engine import ai_extractor
+from app.core.engine import anonymity
 from app.core.engine.dedupe import fingerprint_lead
 from app.core.engine.extractor import extract_fields, extract_records, ExtractionError
 from app.core.engine.qualifier import qualify_html
@@ -84,6 +85,14 @@ class ScrapeJobWorker(QObject):
         self._base_fields = fields
         self._base_detail_config = detail_config
 
+        # Anonymity/rotation state (see _prepare_proxy() below):
+        # - the untouched proxy list exactly as the user entered it
+        # - a per-request counter (drives Tor's NEWNYM circuit rotation)
+        # - a lazy CyclicProxyRotator for "list"/"rotating" modes
+        self._proxy_pool: list[str] = list(options.proxy.proxies)
+        self._rotator = None
+        self._request_seq = 0
+
         self._stop_requested = False
         self._pause_requested = False
 
@@ -114,6 +123,7 @@ class ScrapeJobWorker(QObject):
         try:
             self.status_changed.emit(JobStatus.RUNNING.value)
             self._emit_log(LogLevel.INFO, "بدء عملية الاستخراج")
+            self._check_tor_at_start()
 
             queue: deque[tuple[str, int]] = deque((u, 0) for u in self.target.start_urls)  # (url, depth)
             seen: set[str] = set(self.target.start_urls)
@@ -151,6 +161,10 @@ class ScrapeJobWorker(QObject):
                     break  # Stop was clicked during the delay itself
 
                 url, depth = queue.popleft()
+                # Pick this request's identity BEFORE fetching: rotate the
+                # proxy / Tor circuit so consecutive requests don't leave
+                # from the same IP (see _prepare_proxy()).
+                self._prepare_proxy()
                 # Multi-source runs: pick this URL's own container/fields/
                 # detail_config before fetching+extracting it - see the
                 # source_profiles docstring in __init__ above. A no-op
@@ -260,6 +274,146 @@ class ScrapeJobWorker(QObject):
             self.finished.emit(self.job_id)
 
     # --- helpers ---
+    def _tor_picked(self) -> bool:
+        """Is THIS request's identity the Tor endpoint? (Hybrid mode puts
+        either a user proxy or Tor into options.proxy.proxies[0].)"""
+        proxy = self.options.proxy
+        if proxy.mode == "tor":
+            return True
+        return bool(proxy.mode == "hybrid" and proxy.proxies
+                    and proxy.proxies[0].startswith("socks5://127.0.0.1:"))
+
+    def _build_hybrid_pool(self) -> list[str]:
+        """One rotation pool out of the user's proxies + the Tor endpoint.
+        This is what lets a site that blocks Tor exit IPs be scraped
+        anyway: identities alternate, and blocked ones get skipped (see
+        _rotate_identity_on_block)."""
+        proxy = self.options.proxy
+        pool = [p for p in self._proxy_pool if p.strip()]
+        tor_url = anonymity.tor_socks_url(proxy.tor_socks_port, for_http=False)
+        if tor_url not in pool:
+            pool.append(tor_url)
+        return pool
+
+    def _rotate_identity_on_block(self, url: str, reason: str) -> None:
+        """Called when a fetch comes back blocked (403/429/Cloudflare...).
+        Retry-on-block is where 'sites that block Tor' get beaten: instead
+        of waiting tor_rotate_every requests, drop this identity NOW -
+        Tor gets an immediate NEWNYM (new exit node), proxy lists advance
+        to the next entry - so the retry goes out from a DIFFERENT IP."""
+        proxy = self.options.proxy
+        if proxy.mode == "tor":
+            ok, msg = anonymity.rotate_tor_circuit(proxy.tor_control_port, proxy.tor_control_password)
+            self._emit_log(LogLevel.WARNING if not ok else LogLevel.INFO,
+                           f"الموقع رفض الهوية ({url}) - تدوير فوري لدائرة Tor: {msg}")
+            return
+        if proxy.mode == "hybrid":
+            if self._tor_picked():
+                ok, msg = anonymity.rotate_tor_circuit(proxy.tor_control_port, proxy.tor_control_password)
+                level = LogLevel.INFO if ok else LogLevel.DEBUG
+                self._emit_log(level, f"بلوك على هوية Tor من {url}: {msg}")
+            if self._rotator is not None and len(self._rotator) > 1:
+                # advance past the blocked identity (and one more when the
+                # pool is big enough) - the LAST advanced-to entry IS the
+                # new identity, pinned for the retry that's about to run
+                # inside _fetch_with_retries (before the next
+                # _prepare_proxy() would). The re-advance guard below keeps
+                # the pinned identity != the blocked one even if the
+                # rotator's internal index drifted out of sync with
+                # proxy.proxies (tiny pools, manual state changes).
+                old = proxy.proxies[0] if proxy.proxies else None
+                skip = min(2, len(self._rotator) - 1)
+                advanced = [self._rotator.next() for _ in range(skip)]
+                new = advanced[-1]
+                if new == old and len(self._rotator) > 1:
+                    new = self._rotator.next()
+                proxy.proxies = [new]
+                self._emit_log(LogLevel.INFO,
+                               f"بلوك ({url}) - تجاوز {', '.join(advanced[:-1]) or 'الهوية الحالية'} "
+                               f"والتحويل للهوية: {new}")
+        elif proxy.mode in ("list", "rotating"):
+            if self._rotator is None:
+                self._rotator = anonymity.CyclicProxyRotator(self._proxy_pool or [p for p in proxy.proxies if p])
+            if len(self._rotator) > 1:
+                old = proxy.proxies[0] if proxy.proxies else None
+                new = self._rotator.next()
+                if new == old and len(self._rotator) > 1:
+                    new = self._rotator.next()
+                proxy.proxies = [new]
+                self._emit_log(LogLevel.INFO, f"بلوك ({url}) - تبديل البروكسي إلى: {new}")
+
+    def _prepare_proxy(self) -> None:
+        """Runs before EVERY fetch: makes options.proxy.proxies exactly one
+        entry - the one this particular request should use.
+
+        - "list"/"rotating": cyclically rotate through the user's list.
+          This is the actual fix for the reported behavior 'الموقع بيكشف
+          إن فيه ريكويستات كتير': the UI collected a proxy list but the
+          adapter always used proxies[0], so every request went out from
+          the SAME IP no matter which mode was picked.
+        - "tor": always the local Tor SOCKS endpoint, and every
+          tor_rotate_every requests we signal Tor (NEWNYM) to rebuild its
+          circuit so the exit IP changes mid-run.
+        - "hybrid": one cyclic pool = the user's proxies + the Tor
+          endpoint (the anti-"sites that block Tor" mode), with the same
+          periodic NEWNYM rotation whenever Tor is the picked identity.
+        - "none"/"single": unchanged (single entry or empty already).
+
+        Mutating self.options (instead of threading a separate proxy arg
+        through fetch_one) is deliberate: options.proxy is already the
+        single source the adapter and every enrichment path (qualifier,
+        detail pages, owner lookup) read, so one write here covers all of
+        them."""
+        proxy = self.options.proxy
+        if proxy.mode in ("list", "rotating") and len(self._proxy_pool) > 1:
+            if self._rotator is None:
+                self._rotator = anonymity.CyclicProxyRotator(self._proxy_pool)
+            proxy.proxies = [self._rotator.next()]
+            return
+        if proxy.mode in ("tor", "hybrid"):
+            if proxy.mode == "hybrid":
+                pool = self._build_hybrid_pool()
+                if len(pool) > 1:
+                    if self._rotator is None or len(self._rotator) != len(pool):
+                        self._rotator = anonymity.CyclicProxyRotator(pool)
+                    proxy.proxies = [self._rotator.next()]
+                else:
+                    proxy.proxies = [pool[0]]
+            else:
+                proxy.proxies = [anonymity.tor_socks_url(proxy.tor_socks_port, for_http=False)]
+            self._request_seq += 1
+            every = max(0, proxy.tor_rotate_every)
+            if every and self._tor_picked() and self._request_seq % every == 0:
+                ok, reason = anonymity.rotate_tor_circuit(proxy.tor_control_port, proxy.tor_control_password)
+                level = LogLevel.SUCCESS if ok else LogLevel.WARNING
+                self._emit_log(level, f"تدوير هوية Tor ({self._request_seq}): {reason}")
+
+    def _check_tor_at_start(self) -> None:
+        """One-time startup sanity check for tor mode: without a listening
+        SOCKS port every single fetch would fail with the same confusing
+        connection error - say so ONCE, clearly, instead."""
+        proxy = self.options.proxy
+        if proxy.mode not in ("tor", "hybrid"):
+            return
+        if proxy.mode == "tor":
+            if anonymity.tor_reachable(proxy.tor_socks_port):
+                self._emit_log(LogLevel.SUCCESS,
+                               f"وضع مجهول مفعّل: الترافيك هيعدّي على Tor (127.0.0.1:{proxy.tor_socks_port})"
+                               + (f"، تدوير الكيركيت كل {proxy.tor_rotate_every} ريكويست" if proxy.tor_rotate_every else ""))
+            else:
+                self._emit_log(LogLevel.ERROR,
+                               f"مفيش حاجة شغالة على 127.0.0.1:{proxy.tor_socks_port} - شغّل Tor الأول "
+                               "(Tor Browser أو tor.exe) وإلا كل الريكويستات هتفشل")
+        else:  # hybrid: Tor is one identity among the user's proxies
+            if not self._build_hybrid_pool() or not anonymity.tor_reachable(proxy.tor_socks_port):
+                self._emit_log(LogLevel.WARNING,
+                               f"وضع Hybrid: مفيش حاجة شغالة على منفذ Tor {proxy.tor_socks_port} - "
+                               "التدوير هيكمل على البروكسيات بس. شغّل Tor لو عايز التور يشارك.")
+            elif len(self._build_hybrid_pool()) < 2:
+                self._emit_log(LogLevel.WARNING,
+                               "وضع Hybrid محتاج بروكسي واحد على الأقل في القايمة غير التور - "
+                               "حالياً كل الريكويستات هتعدّي على Tor بس")
+
     def _fetch_with_retries(self, url: str):
         last_error = None
         attempts = max(1, self.options.retries + 1)
@@ -277,6 +431,12 @@ class ScrapeJobWorker(QObject):
             except engine.FetchError as e:
                 last_error = str(e.reason)
                 if attempt < attempts:
+                    # A block (403/429/Cloudflare...) is a statement about
+                    # the IDENTITY, not the URL - retrying from the same IP
+                    # just gets blocked again (this was Yelp's whole 403
+                    # wall). Rotate the identity first, THEN retry.
+                    if anonymity.looks_like_block(last_error):
+                        self._rotate_identity_on_block(url, last_error)
                     self._emit_log(LogLevel.WARNING, f"إعادة محاولة {attempt}/{attempts - 1} لـ {url}: {last_error}")
                     self._interruptible_sleep(min(2 ** attempt, 10))
                     if self._stop_requested:

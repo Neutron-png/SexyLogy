@@ -1,167 +1,268 @@
-# LOGY
+# LOGY — Anonymous Lead-Generation Crawler
 
-A desktop GUI for web scraping and lead generation, built on top of the
-Custom scraping engine.
+LOGY is a desktop (PySide6) lead-generation scraper built on [Scrapling](https://github.com/D4Vinci/Scrapling):
+point it at business directories (Yelp, Yellowpages, Thumbtack…), pick a niche + city, and it crawls,
+extracts, deduplicates and exports leads — now with a full **per-request identity-rotation engine**
+so targets can't fingerprint a single IP.
 
-## What's implemented
+---
 
-This is a real, wired-up application - not a mockup. Every button that
-appears in the UI is connected to real logic; nothing renders fake data.
+## What's new: the Anonymity Engine
 
-| Layer | Status | Notes |
+### The problem it solves
+
+Two facts define web anonymity, and everything in this engine follows from them:
+
+1. **Websites never see your MAC address.** It's a layer-2 identifier that dies at the first router.
+   The *only* network identity a target can observe is your **IP address**. (This is why the engine
+   rotates IPs and deliberately fakes nothing else.)
+2. **Sites that "block Tor" are not detecting the browser.** Tor exit nodes are *publicly listed*;
+   targets match your IP against those lists. Disguising the client as Chromium fixes the
+   *fingerprint*, not the *gate*.
+
+The historical bug this engine replaced: the UI collected a proxy list, the mode said "Rotating",
+but the adapter read `proxies[0]` every time — **one IP for an entire 500-page run** (the direct
+cause of the Yelp 403 wall: 91/91 requests failed).
+
+### The pipeline
+
+```
+┌──────────────┐    ┌───────────────────┐    ┌──────────────────┐
+│ REQUEST QUEUE│──▶ │ IDENTITY PICKER   │──▶ │ SCHEME NORMALIZER│──▶ TARGET SITE
+└──────────────┘    └─────────┬─────────┘    └────────┬─────────┘
+                              │ cyclic pool:          │ curl-cffi → socks5h:// (remote DNS)
+                              │  proxy-1, proxy-2,    │ chromium  → socks5://  (pw whitelist)
+                              │  tor@127.0.0.1:9050
+                              ▼
+                 ┌─────────────────────────────┐
+                 │ BLOCKED: 403 / 429 / CF     │
+                 └──────────────┬──────────────┘
+                                ▼
+                 INSTANT FAILOVER ── SIGNAL NEWNYM → control:9051 → new exit IP
+                                └─ skip identity → retry from a different IP
+```
+
+### Proxy modes
+
+| Mode | Rotation | Best for |
 |---|---|---|
-| App shell, sidebar nav, dark theme | Done | `app/ui/main_window.py`, `app/ui/theme.py` |
-| New Scrape screen (Target / Extract / Options / Proxy) | Done | `app/ui/screens/new_scrape.py` |
-| Field Builder (visual, no-code) | Done | `app/ui/widgets/field_builder.py` |
-| Smart Extraction (NL -> fields) | Done, rule-based | `app/core/engine/nl_to_fields.py` - keyword matcher, not an LLM call. See note below. |
-| JSON Schema mode | Done | validated before a job can start |
-| Scrapling integration (Fetcher/DynamicFetcher/StealthyFetcher) | Done | `app/core/engine/scrapling_adapter.py` - the only file that imports `scrapling` |
-| Background job manager (QThread, pause/resume/stop) | Done | `app/core/job_manager.py` |
-| Live logs + progress + virtualized results table | Done | `app/ui/widgets/log_panel.py`, `app/ui/widgets/results_table.py` |
-| Export (CSV/JSON/JSONL/XLSX), streamed | Done | `app/core/exports/exporter.py` |
-| Projects / History / Templates / Settings / API Keys / Logs screens | Done | SQLite-backed, `app/core/storage/db.py` |
-| Encrypted secret storage for proxy/API credentials | Done | `app/core/storage/secrets.py` (Fernet) |
-| Page Preview / visual "click an element" Selector Assistant | **Not implemented yet** | needs an embedded browser widget (`QWebEngineView`); see "Next steps" |
-| Spider-based multi-page crawling with Scrapling's own `Spider` class | **Partial** | current job manager does its own BFS crawl via `fetch_one` + `extract_links`; swapping in `scrapling.spiders.Spider` directly (with its native pause/resume-to-disk) is a follow-up, see below |
-| PyInstaller packaging | Documented, not run | must be built on the target OS, see "Packaging" |
+| No proxy | — | Trusted, robots-friendly targets |
+| Single proxy | — | One dedicated exit, low-volume runs |
+| **Proxy list** | Cyclic per request + skip-on-block | Paid pools, stable identity set |
+| **Tor** | NEWNYM every N requests + on block | Full anonymity, tolerant targets |
+| **Hybrid** ⭐ | Proxies + Tor in ONE pool; blocked identities skipped instantly | Sites that blanket-block Tor exits |
 
-## Why the "Smart Extraction" mode isn't AI-backed by default
+---
 
-The spec asks for the AI layer to be isolated from the scraping engine
-and *not required* for basic scraping to work. `nl_to_fields.py`
-implements `generate_fields(description) -> list[ExtractionField]` as a
-small keyword matcher, which is honest about what it does rather than
-pretending to be an LLM. Swapping in a real LLM call later means
-implementing the same function signature and pointing
-`new_scrape.py -> _generate_smart_fields()` at it - nothing else changes.
+## The algorithms & the math
 
-## Important limitation of this build
+### 1. Round-Robin cyclic rotation — `anonymity.CyclicProxyRotator`
 
-This codebase was written and unit-tested in a network-isolated sandbox
-that cannot reach PyPI or download Playwright/patchright browser
-binaries. That means:
+A pool of `n` identities and a monotonic counter `i`. The request at step `t` takes
+entry `(i₀ + t) mod n`; the modulo wrap makes the list infinite.
 
-- The pure-Python core (`app/core/engine/extractor.py`,
-  `app/utils/validation.py`, `app/core/storage/db.py`,
-  `app/core/exports/exporter.py`) was actually executed and verified -
-  run `python tests/run_tests.py` (no pytest required) and you'll see
-  24/24 tests pass.
-- The PySide6 UI and the real Scrapling calls were written against the
-  documented APIs but **could not be launched or click-tested** in this
-  environment, since `pip install PySide6` / `pip install scrapling` /
-  `scrapling install` all require network access this sandbox doesn't
-  have. `python -m py_compile` confirms every file is syntactically
-  valid, but that is not the same as running it.
+```
+identity(t)      = pool[(i₀ + t) mod n]
+P(identity = pool_j) = 1/n          # perfectly uniform after every cycle
+λ_identity        = λ_total / n     # per-identity request rate
+```
 
-You should expect the first real run on your machine to surface a few
-integration-level bugs (an off-by-one in a Qt layout, a Scrapling
-keyword argument that changed between versions, etc.) - that's normal
-for a from-scratch build validated this way, and this document tells you
-exactly how to find and fix them quickly.
+Most WAFs decide on a *threshold*: "after m requests from one IP → block".
+Single IP dies at `m`. Under uniform rotation, the capacity is:
 
-## Setup (on your own machine)
+```
+T_block(single IP) = m
+T_block(rotated)   ≈ n · m           # anti-ban capacity grows LINEARLY in pool size
+```
+
+### 2. Tor NEWNYM circuit rotation — `anonymity.rotate_tor_circuit()`
+
+Tor routes traffic through a 3-node circuit (Guard → Middle → **Exit**); the target sees only the
+Exit. `SIGNAL NEWNYM` on the control port (9051) orders the daemon to build fresh circuits:
+
+```
+old:  G₁ → M₁ → E₁   →  site sees IP(E₁)   # listed → blocked
+new:  G₁ → M₂ → E₂   →  site sees IP(E₂)   # different exit, different IP
+```
+
+With `|E| ≈ 1000–1500` live exits:
+
+```
+P(new exit ≠ old exit) = 1 − 1/|E| ≈ 99.9%
+```
+
+Notes: the *Guard* stays stable for months (Tor's own policy) — but it's invisible to the target,
+so it costs nothing. Auth order: `control_auth_cookie` first, control password as fallback,
+unauthenticated last. **Strictly best-effort**: a failed rotation returns `(False, reason)` and
+logs a warning — it never aborts a scrape.
+
+### 3. Block classification — `anonymity.looks_like_block()`
+
+A linear classifier over string markers:
+
+```
+is_block(reason) = ∃ m ∈ {403, 429, 503, cloudflare, captcha, forbidden, banned, blocked}
+                    : m ⊑ lower(reason)          # complexity O(k·|s|)
+```
+
+**Conservative on purpose.** Costs are asymmetric: a false negative costs one wasted retry; a
+false positive throws away a perfectly good identity and burns a Tor circuit for nothing.
+Therefore 404 and "connection refused" are *deliberately not* markers.
+
+### 4. Instant failover — `job_manager._rotate_identity_on_block()`
+
+On a detected block the engine doesn't wait for the scheduled rotation window — it jumps the
+counter ahead and pins the landing identity for the imminent retry (which runs *inside*
+`_fetch_with_retries`, before the next scheduled rotation):
+
+```
+skip         = min(2, n − 1)
+new_identity = pool[(i + skip) mod n]
+```
+
+**The invariant:** the new identity is never the blocked one —
+
+```
+(i + skip) mod n ≠ i   ⟺   skip mod n ≠ 0
+```
+
+which is guaranteed because `1 ≤ skip ≤ n−1`. Why `min(2, n−1)` *exactly*: the upper bound `n−1`
+is forced by the invariant (jumping `n` would land back on the blocked entry); taking **2**
+instead of 1 (when the pool allows) skips over the entry likely blocked in the previous wave too.
+A drift guard re-advances if the pinned identity somehow equals the blocked one.
+
+Retry success follows a **geometric distribution** — if a random identity is clean with
+probability `q`:
+
+```
+P(success within k tries) = 1 − (1 − q)^k
+
+q = 0.8 →  k=1: 80%   k=2: 96%   k=3: 99.2%
+```
+
+### 5. Hybrid pooling — the anti-"Tor blocked" mode
+
+User proxies and the Tor endpoint merge into one pool. If a fraction `f` of the pool is blocked
+(say, every exit on the target's list), a *double* failure requires two independent draws into
+the blocked set:
+
+```
+P(single request hits blocked)  = f
+P(retry ALSO hits blocked)      = f²
+
+# f = 0.2  →  retry fails too only 4% of the time
+#            (vs. 100% pre-failover on a tor-only run)
+```
+
+**The thesis:** independence between identities converts a *likely, repeated* failure into a
+*rare, quadratic* one. Tor's exit IPs stop being a single point of failure.
+
+### 6. Exponential backoff — `job_manager._interruptible_sleep()`
+
+```
+sleep(attempt) = min(2^attempt, 10) seconds    # 2s → 4s → 8s → 8s → 8s
+```
+
+Anti-"retry storm" profile. It also matters against **timing-pattern detection**: WAFs treat
+deterministic machine-like gaps as a bot signal; the exponential curve plus identity rotation
+scatter the timing beyond easy classification.
+
+### Scorecard
+
+| Scenario | Without the engine | With the engine |
+|---|---|---|
+| Requests before first block (threshold m per IP) | ≈ m | ≈ n·m |
+| Max distinct exit IPs | 1 | 1 + (proxies) + ~1000 Tor exits |
+| Retry success after a block | ≈ 0% (same IP) | 1 − (1−q)^k → 96% by k=2 |
+| Consecutive-failure probability (f=0.2) | 20% | 4% |
+| Timing-pattern bot detection | Trivial (uniform gaps) | Scattered by backoff + rotation |
+
+### Honest limits
+
+- **Behavioral fingerprinting is out of scope.** Targets like Yelp/Cloudflare also model mouse
+  movement, request ordering and JS execution — rotation says nothing there; that's the stealth
+  engine's job (Scrapling's Chromium stealth + `solve_cloudflare`).
+- **Worst case:** a target that blocks every Tor exit *and* every datacenter range leaves only
+  **residential proxies** — they lead the ops checklist below.
+- **MAC rotation is not implemented on purpose** — it cannot help against websites.
+
+### Engineering details worth knowing
+
+- **Two proxy schemes, one Tor:** curl-cffi (FAST_HTTP) gets `socks5h://` — the trailing `h`
+  resolves DNS *through* Tor, so the machine's resolver never sees the hostname. Playwright-based
+  engines (Dynamic/Stealth) get `socks5://` — their proxy validator rejects `socks5h`.
+  `_normalize_tor_scheme()` rewrites the scheme per engine, per request.
+- **WebRTC leak blocked on Tor hops:** WebRTC STUN dials *around* SOCKS tunnels and leaks the
+  real IP. `block_webrtc=True` is applied automatically — but only on requests actually
+  tunneling through Tor (`_is_tor()`), not on plain-proxy hybrid requests.
+- **Startup probe:** tor mode checks `127.0.0.1:9050` once and reports clearly if it's dead —
+  instead of failing every request with the same confusing error.
+- **Per-request pinning:** `_prepare_proxy()` writes the chosen identity into
+  `options.proxy.proxies[0]` — the single field every engine and enrichment path reads, so one
+  write covers the main crawl plus detail-page/qualifier/owner-lookup fetches.
+- **Encrypted at rest:** proxy credentials are never written to logs or exports.
+
+### Ops checklist
+
+1. **Start Tor Browser (or `tor.exe`) first** — the SOCKS port is 9050, control 9051 by default.
+2. **Residential > datacenter.** Datacenter ranges get flagged almost as fast as Tor exits.
+3. **Keep `block_webrtc` on** for Tor hops (automatic).
+4. **Pin your exits** — `torrc`: `ExitNodes {us},{de}` + `StrictNodes 1`, to choose exit
+   countries the target doesn't blanket-block.
+
+---
+
+## Architecture
+
+```
+UI (PySide6)
+ └─ JobManager (QThread)              app/core/job_manager.py
+     ├─ anonymity.py                  # NEW: identity rotation, Tor control, block detection
+     ├─ scrapling_adapter.py          # the ONLY module importing Scrapling
+     ├─ extractor.py / ai_extractor.py
+     ├─ dedupe.py                     # cross-job lead history
+     └─ storage/db.py (sqlite3, thread-safe)
+```
+
+- **UI → Job Manager → Scraping Engine → Scrapling** boundary; the UI never touches Scrapling.
+- Scrapling fetcher modes: `FAST_HTTP` (curl-cffi, TLS impersonation), `DYNAMIC` (Chromium),
+  `STEALTH` (Chromium stealth, Cloudflare solving).
+- Sources are pluggable profiles (`builtin_templates.py`) — per-site containers/fields/detail configs.
+- AI Auto-Extract mode: no selectors; an LLM reads page text and fills field names
+  (Anthropic/OpenAI). Owner-lookup enrichment reads a lead's own published site only —
+  no automated LinkedIn people-search, by design.
+
+## Run
+
+```bat
+run.bat          # Windows — points system Python 3.14 at the venv's site-packages
+```
+
+or
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-scrapling install                # downloads the browser binaries Stealth/Dynamic fetchers need
+pip install scrapling && scrapling install
 python main.py
 ```
 
-On first run LOGY creates a SQLite database under your OS's app-data
-folder (`%APPDATA%/LOGY` on Windows, `~/.local/share/LOGY` on Linux) and
-seeds the built-in templates. The sidebar's "Engine" indicator shows red
-if `scrapling` failed to import - hover it for the reason.
-
-## Running the tests
+Tests:
 
 ```bash
-python tests/run_tests.py     # zero extra dependencies
-# or, if you have pytest installed:
-pytest
+python tests/run_tests.py        # 102/103 passing (1 pre-existing qualifier fixture failure)
 ```
 
-## Project structure
+## Layout
 
 ```
-main.py                        entry point
 app/
-  ui/                           PySide6 screens/widgets/theme - no scraping logic here
-    main_window.py, sidebar.py, theme.py
-    screens/                    New Scrape, Dashboard, Projects, History, Templates, Settings, API Keys, Logs
-    widgets/                    FieldBuilder, ResultsTableModel (virtualized), LogPanel
   core/
-    models.py                   plain dataclasses, no Qt/Scrapling imports
-    job_manager.py               QThread-based background job runner
-    engine/
-      scrapling_adapter.py       the ONLY file that imports `scrapling`
-      extractor.py                applies ExtractionFields to a fetched page
-      nl_to_fields.py              Smart Extraction keyword matcher
-      builtin_templates.py         seeds Business Leads / Product Data / etc.
-    storage/
-      db.py                       SQLite: projects, jobs, results, logs, settings, templates
-      secrets.py                   Fernet-encrypted credential storage
-    exports/
-      exporter.py                  streamed CSV/JSON/JSONL/XLSX export
-  utils/
-    validation.py                 URL/selector/JSON-schema validation
-tests/                            24 passing tests for everything that doesn't need Qt/network
+    engine/        # anonymity.py, scrapling_adapter.py, extractor.py, ai_extractor.py,
+                   # builtin_templates.py, dedupe.py, qualifier.py, nl_to_fields.py
+    job_manager.py # QThread worker: queue, retries, failover, enrichment
+    exports/       # CSV / JSON / JSONL / XLSX / Odoo exporters
+    storage/       # db.py (thread-safe sqlite3), secrets.py (DPAPI-backed)
+  ui/              # main_window, sidebar, theme (dark QSS), screens/, widgets/, dialogs/
+main.py            # entry point
+run.bat            # Windows launcher
+design_prototypes/ # HTML design docs incl. the full engineering deep-dive page
 ```
-
-## Packaging into a desktop executable
-
-PyInstaller must run **on the target OS** - build the Windows `.exe` on a
-Windows machine, the macOS app on macOS, etc. This could not be produced
-inside this sandbox (Linux container, no PyInstaller/PySide6 available).
-
-```bash
-pip install pyinstaller
-pyinstaller --name LOGY --windowed --onedir main.py
-```
-
-Notes for a clean Windows build:
-- `--windowed` suppresses the console window.
-- Scrapling's browser binaries (downloaded by `scrapling install`) live
-  outside the PyInstaller bundle by default - either instruct users to
-  run `scrapling install` once after installing LOGY, or bundle the
-  browser directory with `--add-data` and set `executable_path` /
-  `cdp_url` accordingly in `scrapling_adapter.py`.
-- Add an `.ico` built from the LOGY icon and pass `--icon logy.ico`.
-
-## Known gaps vs. the full spec, and suggested next steps
-
-1. **Page Preview / click-to-select Selector Assistant (spec section 9).**
-   Needs `QWebEngineView` (from `PySide6-Addons`/`PyQt6-WebEngine`) to
-   render the target page, a JS injection to highlight the hovered
-   element and report its computed CSS/XPath back to Python via
-   `QWebChannel`, and a "Use this element" button that writes into the
-   Field Builder. This is a self-contained addition to
-   `app/ui/screens/new_scrape.py` - it doesn't touch the engine layer.
-2. **Native Scrapling `Spider` for multi-page crawls.** The current job
-   manager does its own breadth-first crawl loop calling
-   `scrapling_adapter.fetch_one()` per page. Scrapling's own `Spider`
-   class (see `scrapling.spiders.Spider`) natively supports
-   `concurrent_requests`, `response.follow()`, and disk-backed
-   pause/resume (`crawldir=`). Migrating `ScrapeJobWorker.run()` to drive
-   a `Spider` subclass instead of a manual queue would pick up that
-   pause/resume-across-restarts behavior for free - worth doing once the
-   manual loop above is confirmed working end-to-end.
-3. **First-run dependency wizard (spec section 23).** Right now a missing
-   Scrapling install just shows a red status dot in the sidebar and a
-   blocking error dialog on Start. A proper first-run screen (checklist
-   UI, "Install Required Components" button that shells out to
-   `pip install scrapling && scrapling install` with a progress log)
-   would match the spec more closely - `app/ui/screens/settings.py`'s
-   Browser tab has the status check already; it just needs the install
-   flow wired to a QProcess.
-4. **Proxy rotation across a list.** `scrapling_adapter._proxy_kwarg()`
-   currently always returns `proxies[0]`; true rotation (round-robin or
-   random per request) needs a small stateful picker in
-   `ScrapeJobWorker` that advances an index each time `fetch_one()` is
-   called with `proxy.mode == "list"/"rotating"`.
-5. **Run this on a machine with network access** and fix whatever
-   surfaces on the first real `python main.py` - see the limitation note
-   above.
-## **NOTE**
-انا افجر واحد في بلدكوووووووووووووو

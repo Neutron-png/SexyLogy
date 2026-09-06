@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Iterator, Optional
 
+from app.core.engine import anonymity
 from app.core.models import FetcherMode, ScrapeOptions, ProxyConfig
 
 try:
@@ -68,17 +69,47 @@ class FetchResult:
     ok: bool
 
 
-def _proxy_kwarg(proxy: ProxyConfig) -> Optional[str]:
+def _normalize_tor_scheme(proxy_str: str, for_http: bool) -> str:
+    """Hybrid mode mixes user proxies with the Tor endpoint in ONE pool, so
+    a plain 'socks5://127.0.0.1:<port>' can land on any engine. This keeps
+    each engine's scheme requirement satisfied: socks5h (remote DNS) for
+    curl-cffi, socks5 for the Playwright browsers - and passes everything
+    else through untouched."""
+    if proxy_str.startswith("socks5://127.0.0.1:"):
+        return anonymity.tor_socks_url(int(proxy_str.rsplit(":", 1)[1]), for_http=for_http)
+    return proxy_str
+
+
+def _proxy_kwarg(proxy: ProxyConfig, for_http: bool) -> Optional[str]:
     """Scrapling's fetchers accept a single `proxy=` string per request.
     Rotation across a list is handled by the job manager picking a
-    different entry per request, not by Scrapling itself."""
-    if proxy.mode == "none" or not proxy.proxies:
+    different entry per request and passing it back via proxy.proxies[0].
+
+    mode == "tor": tunnel through the local Tor daemon. Scheme depends on
+    the engine - socks5h (remote DNS) for curl-cffi, plain socks5 for the
+    Playwright-based engines (their validator rejects socks5h). See
+    app/core/engine/anonymity.py for why the schemes differ.
+    mode == "hybrid": the job manager put either a user proxy OR the Tor
+    endpoint in proxies[0] - normalize the Tor scheme per engine here."""
+    if proxy.mode == "none":
+        return None
+    if proxy.mode == "tor":
+        return anonymity.tor_socks_url(proxy.tor_socks_port, for_http=for_http)
+    if not proxy.proxies:
         return None
     if proxy.mode == "single":
         return proxy.proxies[0]
-    # "list" / "rotating": caller (job manager) selects the index and
-    # passes it back in via proxy.proxies[0] for this particular call.
-    return proxy.proxies[0]
+    # "list" / "rotating" / "hybrid": caller (job manager) selects the
+    # entry and passes it back in via proxy.proxies[0] for this call.
+    return _normalize_tor_scheme(proxy.proxies[0], for_http)
+
+
+def _is_tor(proxy: ProxyConfig) -> bool:
+    if proxy.mode == "tor":
+        return True
+    # hybrid: WebRTC blocking is needed only for the requests that are
+    # actually tunneling through Tor this time, not the plain-proxy ones
+    return bool(proxy.mode == "hybrid" and proxy.proxies and proxy.proxies[0].startswith("socks5://127.0.0.1:"))
 
 
 def require_scrapling():
@@ -136,7 +167,7 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None) -> FetchResult
     a per-URL job error rather than crashing the run.
     """
     require_scrapling()
-    proxy = _proxy_kwarg(options.proxy)
+    proxy = _proxy_kwarg(options.proxy, for_http=(options.fetcher_mode == FetcherMode.FAST_HTTP))
 
     def _do_fetch():
         if options.fetcher_mode == FetcherMode.FAST_HTTP:
@@ -163,6 +194,11 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None) -> FetchResult
                 headless=options.headless,
                 network_idle=options.network_idle,
                 solve_cloudflare=options.solve_cloudflare,
+                # Through Tor, WebRTC would happily dial STUN servers DIRECTLY
+                # (bypassing the SOCKS tunnel) and hand the site the machine's
+                # real IP - block it whenever we're tunneling. Stealth engine
+                # supports this flag; the plain Dynamic engine doesn't.
+                block_webrtc=_is_tor(options.proxy),
                 timeout=options.timeout_s * 1000,
                 proxy=proxy,
             )
@@ -228,7 +264,7 @@ def make_session(options: ScrapeOptions):
     Caller is responsible for using it as a context manager.
     """
     require_scrapling()
-    proxy = _proxy_kwarg(options.proxy)
+    proxy = _proxy_kwarg(options.proxy, for_http=(options.fetcher_mode == FetcherMode.FAST_HTTP))
 
     if options.fetcher_mode == FetcherMode.FAST_HTTP:
         return FetcherSession(impersonate="chrome", proxy=proxy)
@@ -243,6 +279,7 @@ def make_session(options: ScrapeOptions):
         return StealthySession(
             headless=options.headless,
             solve_cloudflare=options.solve_cloudflare,
+            block_webrtc=_is_tor(options.proxy),
             max_pages=max(1, options.concurrency),
             proxy=proxy,
         )
