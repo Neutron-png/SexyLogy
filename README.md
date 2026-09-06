@@ -1,6 +1,6 @@
 # LOGY — Anonymous Lead-Generation Crawler
 
-LOGY is a desktop (PySide6) lead-generation scraper built on [Scrapling](https://github.com/D4Vinci/Scrapling):
+LOGY is a desktop (PySide6) lead-generation scraper built on custom scraping engine
 point it at business directories (Yelp, Yellowpages, Thumbtack…), pick a niche + city, and it crawls,
 extracts, deduplicates and exports leads — now with a full **per-request identity-rotation engine**
 so targets can't fingerprint a single IP.
