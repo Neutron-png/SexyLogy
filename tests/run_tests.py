@@ -22,6 +22,7 @@ TEST_MODULES = [
     "tests.test_html_to_text",
     "tests.test_builtin_templates",
     "tests.test_dedupe",
+    "tests.test_brain",
 ]
 
 

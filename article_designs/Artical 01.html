@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Crawler That Learns to Stop — LOGY Engineering Poster № 05</title>
+<style>
+  :root{--bg:#f4f1e8;--ink:#141414;--yellow:#ffd400;--blue:#2b5cff;--red:#ff4b33;--green:#0e9f5f;
+    --sans:'Archivo Black','Segoe UI',sans-serif;--body:'Segoe UI',system-ui,sans-serif;--mono:Consolas,'Cascadia Code',monospace}
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:var(--body);line-height:1.75;padding:40px 20px;font-size:16px}
+  .wrap{max-width:940px;margin:0 auto}
+
+  /* ---------- hero ---------- */
+  .sticker{display:inline-block;background:var(--yellow);border:3px solid var(--ink);padding:6px 16px;
+    font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:2px;box-shadow:6px 6px 0 var(--ink);text-transform:uppercase}
+  h1{font-family:var(--sans);font-size:72px;line-height:.95;letter-spacing:-2px;text-transform:uppercase;margin:34px 0 10px}
+  h1 .hl{background:linear-gradient(transparent 55%,var(--yellow) 55%)}
+  @media(max-width:700px){h1{font-size:46px}}
+  .dek{font-size:19px;max-width:680px;margin-bottom:36px;font-weight:500}
+  .tag-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+  .tag{border:2px solid var(--ink);padding:6px 16px;font-family:var(--mono);font-size:12px;font-weight:700;background:#fff;box-shadow:4px 4px 0 var(--ink)}
+  .tag.red{background:var(--red);color:#fff}
+  .tag.green{background:var(--green);color:#fff}
+
+  /* ---------- content blocks ---------- */
+  .block{border:3px solid var(--ink);background:#fff;box-shadow:8px 8px 0 var(--ink);padding:32px 34px;margin:38px 0}
+  .block h2{font-family:var(--sans);font-size:24px;text-transform:uppercase;letter-spacing:-.5px;margin-bottom:6px}
+  .block h2 .no{display:inline-block;background:var(--ink);color:var(--yellow);padding:2px 12px;margin-right:12px;font-size:18px}
+  .block .why{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+    border:2px solid var(--ink);background:var(--yellow);padding:2px 10px;margin:4px 0 18px}
+  p{font-size:16.5px;margin-bottom:15px;max-width:660px}
+  p b{color:var(--blue)}
+  p .r{color:var(--red);font-weight:600}
+  ul{margin:0 0 15px 22px;max-width:640px}
+  li{margin-bottom:8px}
+  li b{color:var(--blue)}
+
+  /* ---------- equations ---------- */
+  .eq{background:var(--ink);color:#fff;padding:20px 24px;font-family:var(--mono);font-size:13.5px;line-height:2;margin:18px 0;overflow-x:auto;white-space:pre}
+  .eq .y{color:var(--yellow)}.eq .b{color:#7ea2ff}.eq .g{color:#5ce8a4}.eq .r{color:#ff8a7a}.eq .cm{color:#999;font-style:italic}
+  .eq-cap{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--dim,#666);margin-bottom:-10px}
+
+  /* ---------- worked example / tables ---------- */
+  .work{border:3px dashed var(--ink);background:var(--bg);padding:20px 24px;margin:18px 0}
+  .work .cap{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
+  .work table{width:100%;border-collapse:collapse;font-size:14px}
+  .work th{text-align:left;border-bottom:2px solid var(--ink);padding:7px 12px;font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase}
+  .work td{padding:7px 12px;border-bottom:1px solid var(--ink)}
+  .ok{color:var(--green);font-weight:700}.bad{color:var(--red);font-weight:700}
+
+  .pull{border:3px solid var(--ink);background:var(--yellow);box-shadow:8px 8px 0 var(--ink);padding:22px 26px;
+    font-family:var(--sans);font-size:20px;text-transform:uppercase;line-height:1.4;margin:38px 0}
+
+  footer{margin-top:60px;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+    border-top:3px solid var(--ink);padding-top:16px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <span class="sticker">TECHNICAL POSTER · № 05 · PRODUCTION SYSTEM</span>
+  <h1>THE CRAWLER<br>THAT <span class="hl">LEARNS</span><br>TO STOP</h1>
+  <p class="dek">A complete, reasoned walkthrough of the identity-rotation engine inside LOGY — written for people who already scrape, in plain language, with the mathematics exposed and a reason attached to every decision. Fourteen mechanisms, one persistent memory, zero blind retries.</p>
+  <div class="tag-row">
+    <span class="tag">Beta(α,β) posteriors</span>
+    <span class="tag red">AIMD ×0.9/×2</span>
+    <span class="tag">Poisson cluster bursts</span>
+    <span class="tag red">Log-odds breaker</span>
+    <span class="tag">ETag / 304 caching</span>
+    <span class="tag green">Cross-run memory</span>
+  </div>
+
+  <!-- ==================== 01 THREAT MODEL ==================== -->
+  <div class="block">
+    <h2><span class="no">01</span>The Threat Model — What a Website Can Actually See</h2>
+    <div class="why">Why this section exists</div>
+    <p>Every design decision later in this document is downstream of three physical facts. Get these wrong and you build security theater. Get them right and the rest follows almost mechanically.</p>
+    <ul>
+      <li><b>Layer 2 dies at the first router.</b> Your MAC address is a link-local identifier: your machine sends it to your router, your router replaces it with its own on every hop to the internet. No website has ever seen your MAC. Rotating it for web scraping is a ritual, not a defense — so we don't do it, and we say so in the code.</li>
+      <li><b>Layer 3 is the gate.</b> The <span class="r">exit IP</span> is the one identity a target must observe. Every mechanism here rotates, prices, and protects IPs — because that is the only lever that exists.</li>
+      <li><b>"Blocking Tor" is a lookup, not a detection.</b> Tor exit nodes are published lists. A target downloads the list, matches your IP, drops you. Disguising the browser as Chromium fixes the <em>fingerprint</em> (layer 7) but cannot fix a <em>gate</em> (layer 3). This is why our Tor mode is paired with failover and hybrid pooling rather than relying on disguise alone.</li>
+    </ul>
+    <p><b>The historical bug that started this project:</b> the UI collected a proxy list, the mode said "Rotating", but the adapter read <span class="r">proxies[0]</span> every single time. One IP for an entire 500-page run. The user believed they were rotating; they weren't. The 91/91-failed Yelp run was exactly this. Lesson one of the whole document: <em>an anonymity feature that isn't exercised is indistinguishable from no anonymity feature.</em></p>
+  </div>
+
+  <!-- ==================== 02 BETA POSTERIOR ==================== -->
+  <div class="block">
+    <h2><span class="no">02</span>The Trust Ledger — Beta(α,β) Posteriors</h2>
+    <div class="why">Why not just count successes</div>
+    <p>Each identity in the pool holds a posterior distribution over its own block probability, modeled as <b>Beta-Bernoulli</b>: blocks are Bernoulli trials with unknown parameter p, and the Beta family is the conjugate prior, which means updating is just counting:</p>
+    <div class="eq-cap">EQ. 2.1 — The update rule (the entire "AI" is these two lines)</div>
+    <div class="eq"><span class="cm"># after each request through identity j:</span>
+α_j ← α_j + 𝟙[<span class="g">success</span>]      β_j ← β_j + 𝟙[<span class="r">block</span>]
+<span class="y">E[blocked_j] = α_j / (α_j + β_j)</span>        <span class="cm"># posterior mean = trust score</span></div>
+    <p><b>Why the +1/+2 Laplace prior:</b> an identity with zero history gets (0+1)/(0+0+2) = 0.5 — neutral, slightly suspect. This is deliberate. A brand-new IP that has never been tested is not a proven ally; giving it full trust is how you feed your best traffic to a dead proxy. Skepticism toward the unknown is a feature.</p>
+    <p><b>Why a distribution and not a bare ratio:</b> a ratio (5 successes / 5 failures = 50%) treats five data points the same as five thousand. The Beta distribution's <em>concentration</em> — α+β — encodes how much evidence you actually have. Early counts wobble, late counts stabilize. In production we use the posterior mean for selection, and the concentration is what stops one unlucky 403 from demoting a veteran identity.</p>
+    <div class="work">
+      <div class="cap">Worked example — two identities, same ratio, different evidence</div>
+      <table>
+        <tr><th>Identity</th><th>History</th><th>E[blocked]</th><th>Reads as</th></tr>
+        <tr><td>p1</td><td>4 ok / 4 blocked</td><td class="bad">50.0%</td><td>"coin flip, barely tested"</td></tr>
+        <tr><td>p2</td><td>400 ok / 400 blocked</td><td class="bad">50.0%</td><td>"genuinely burned, avoid"</td></tr>
+        <tr><td>p3</td><td>196 ok / 4 blocked</td><td class="ok">2.5%</td><td>"workhorse"</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- ==================== 03 WEIGHTED SELECTION ==================== -->
+  <div class="block">
+    <h2><span class="no">03</span>Weighted Selection — The Pool Re-Ranks Itself</h2>
+    <div class="why">Why not round-robin</div>
+    <p>Round-robin gives every identity equal traffic regardless of quality. That is optimal only when all identities are equal — which they never are. Selection is a categorical draw with posterior-weighted masses:</p>
+    <div class="eq-cap">EQ. 3.1 — Weighted pick (the one line that replaced the broken proxies[0])</div>
+    <div class="eq">weight_j = <span class="g">1 − E[blocked_j]</span>
+<span class="b">pick identity j with P(j) ∝ weight_j</span>     <span class="cm"># random.choices(weights=...)</span></div>
+    <p><b>The consequence is economic, not algorithmic:</b> a 95%-clean identity carries roughly <b>10× the load</b> of a 50% one. The pool is a portfolio that rebalances itself after every request. Bad identities fade toward zero traffic while still being periodically re-tested (they never hit exactly zero, so recovery is possible when a target's mood changes).</p>
+    <p><b>Why this compounds over a run:</b> early on, everything is ~50% and selection is nearly uniform — correct, because we know nothing. As evidence accumulates, the distribution sharpens. The system's information and its behavior stay in lockstep at all times. That property is called <em>matching</em>, and it's the same force behind multi-armed bandits — we're running a lightweight bandit where the arms are IPs.</p>
+  </div>
+
+  <!-- ==================== 04 COOLDOWN ==================== -->
+  <div class="block">
+    <h2><span class="no">04</span>Cooldown — Suspension, Not Execution</h2>
+    <div class="why">Why we stopped deleting blocked identities</div>
+    <p>The naive move on a block is to remove the identity. The correct move is a <span class="r">300-second bench</span> (a <b>cooldown</b> timestamp, <code>blocked_until</code>). Reasons, in order of importance:</p>
+    <ul>
+      <li><b>Most blocks are temporary.</b> Rate-limit windows expire. A 403 at 10:40 usually forgives by 10:45. Deleting the identity throws away a working asset because of a timeout, not a ban.</li>
+      <li><b>Pool depletion is the death of long runs.</b> In a 2000-page crawl with aggressive targets, discard-on-block empties the pool in the first hour. Cooldowns keep the pool sized; it rotates people to the bench instead of off the team.</li>
+      <li><b>Re-testing is information.</b> A cooled identity that succeeds on return earns β→ posterior recovery. The ledger self-corrects in both directions.</li>
+    </ul>
+    <p><b>Edge case, handled explicitly:</b> if <em>every</em> identity is on the bench, we don't fail — we pick the one whose bench time ends soonest. starving the job is worse than reusing a slightly-warm identity.</p>
+  </div>
+
+  <!-- ==================== 05 STICKY ==================== -->
+  <div class="block">
+    <h2><span class="no">05</span>Sticky Identity — Humans Don't Re-IP Mid-Sentence</h2>
+    <div class="why">Why per-request rotation is itself a signal</div>
+    <p>Here is an uncomfortable truth: rotating the IP on <em>every single request to the same site</em> is itself bot-like. A human reading a directory keeps one connection path for their whole session. A crawler that appears from a different country on every page load is describing itself perfectly to anyone logging patterns.</p>
+    <p>So the ledger remembers each domain's <b>sticky identity</b> — the one that last succeeded there — and reuses it with probability <span class="b">s = 0.7</span>:</p>
+    <div class="eq-cap">EQ. 5.1 — The stickiness operator</div>
+    <div class="eq">P(reuse sticky_d) = <span class="y">0.7</span>   <span class="cm"># if eligible (not cooled)</span>
+P(any other)     = 0.3       <span class="cm"># weighted by posterior, as in EQ 3.1</span></div>
+    <p><b>Why 0.7 and not 1.0:</b> full stickiness recreates the original problem (same IP forever). The 30% churn keeps the ledger sampling the other identities on this domain — maintaining its information — while still presenting a mostly-consistent route. <b>Why this survives rotation:</b> the stickiness is <em>per domain</em>, so rotating across domains (where it's safe) happens at full speed while per-domain behavior stays human-shaped.</p>
+  </div>
+
+  <!-- ==================== 06 PERSONA ==================== -->
+  <div class="block">
+    <h2><span class="no">06</span>Persona — An IP Without a Fingerprint Is a Disguise That Doesn't Fit</h2>
+    <div class="why">Why the UA must be derived, not random</div>
+    <p>A new exit IP arriving with last year's fingerprint is a red flag: real humans carry consistent browsers. Each identity therefore owns a <b>persona</b> — useragent + locale + timezone — and the choice is <span class="b">deterministic from SHA-256 of the identity key</span>:</p>
+    <div class="eq-cap">EQ. 6.1 — Deterministic persona assignment</div>
+    <div class="eq">persona_i = POOL[ SHA256(key_i)[0] mod 8 ]        <span class="cm"># same key → same persona, forever</span></div>
+    <p><b>Why deterministic hashing instead of random.choice at request time:</b> randomness means identity #3 is Chrome in New York at 10:00 and Firefox in Berlin at 10:01 — a walking contradiction. Determinism means the pair (IP, persona) is a stable joint identity. The engine ships eight internally-consistent profiles (real modern UA strings with matched locale/timezone), so there are no impossible combinations like a Mac UA with a Windows platform leak.</p>
+    <p><b>Where it plugs in:</b> browser engines take <code>useragent / locale / timezone_id</code> natively; curl-cffi gets the UA via headers. Tor hops additionally force <code>block_webrtc=True</code> — WebRTC STUN dials <em>around</em> SOCKS tunnels and would leak the real IP to the target, which quietly defeats everything else on this poster.</p>
+  </div>
+
+  <!-- ==================== 07 AIMD ==================== -->
+  <div class="block">
+    <h2><span class="no">07</span>AIMD Pacing — Steal the Oldest Honest Algorithm on the Internet</h2>
+    <div class="why">Why TCP congestion control solves our problem exactly</div>
+    <p>TCP solved a mathematically identical problem in 1988: send into a link whose capacity you cannot observe, where exceeding it is catastrophic (packet loss) and underusing it is wasteful. Its answer — <b>Additive Increase, Multiplicative Decrease</b> — maps one-to-one onto scraping: capacity = the target's rate limit, packet loss = 403.</p>
+    <div class="eq-cap">EQ. 7.1 — The per-domain delay recursion</div>
+    <div class="eq">d_{t+1} = clamp( d_t · (0.9)^{𝟙[success]} · (2.0)^{𝟙[block]} , <span class="y">250ms</span>, <span class="y">30s</span> )</div>
+    <p><b>Why multiplicative down and multiplicative up (not additive):</b> the danger is asymmetric. Slowing too little gets you blocked (expensive, visible); slowing too much just wastes time. ×2 on a block makes the cost of over-speed exponential — you converge from above fast. ×0.9 on success makes speed gains cautious and reversible — you approach the ceiling from below slowly. The fixed point sits just under the target's true threshold, and the system <em>finds that threshold without ever being told what it is</em>.</p>
+    <div class="work">
+      <div class="cap">Worked example — finding Yelp's patience in ~15 requests</div>
+      <table>
+        <tr><th>Event</th><th>Delay</th><th>What the engine believes</th></tr>
+        <tr><td>start</td><td>1.50s</td><td>ignorance — the designed prior</td></tr>
+        <tr><td>5 × success</td><td>0.88s</td><td>"this domain tolerates more"</td></tr>
+        <tr><td>block</td><td class="bad">1.77s</td><td>"too fast — back off hard"</td></tr>
+        <tr><td>4 × success</td><td>1.16s</td><td>"ease back in"</td></tr>
+        <tr><td>steady state</td><td class="ok">~1.2-1.4s</td><td>oscillating just under the limit</td></tr>
+      </table>
+      <p style="margin-top:12px;margin-bottom:0">Each domain converges to <em>its own</em> operating point: a sleepy site drops toward 250ms, a hardened one stabilizes near 8s. Same code, no configuration, per-domain memory.</p>
+    </div>
+  </div>
+
+  <!-- ==================== 08 BURST PACER ==================== -->
+  <div class="block">
+    <h2><span class="no">08</span>The Burst Pacer — Timing Is a Fingerprint Too</h2>
+    <div class="why">Why uniform randomness is still uniform</div>
+    <p>Common wisdom says "add random jitter to your delays." Counterpoint: uniformly-jittered gaps are still a flat distribution, and flatness is detectable with one variance test. Real human traffic is not flat — it is <b>bursty</b>: a page loads, three resources follow within seconds, then silence while the human reads. This is the classic domain of the <b>Poisson cluster process</b>:</p>
+    <div class="eq-cap">EQ. 8.1 — Two regimes, probabilistic transitions</div>
+    <div class="eq"><span class="cm"># inside a burst (page-load momentum):</span>
+gap ~ Exp(λ=<span class="g">0.8</span>/s)        <span class="cm"># mean ≈ 1.25s — rapid follow-ups</span>
+<span class="cm"># quiet stretch (human is reading / afk):</span>
+gap ~ Exp(λ=<span class="b">0.05</span>/s)       <span class="cm"># mean ≈ 20s — genuine silence</span>
+<span class="cm"># regime switches are probabilistic (p_enter=0.15, p_exit=0.08)</span></div>
+    <p><b>Why this beats jitter:</b> the signal a detector computes on inter-arrival times — mean, variance, autocorrelation — looks like logged-in user sessions, not like a scheduler. Related to the Hawkes self-exciting family (bursts = excitation, silence = decayed excitation), but implemented as an explicit two-regime process because it is simpler, inspectable, and has no hidden clock state to desync — engineering honesty over mathematical flex.</p>
+    <p><b>Composition rule:</b> the burst gap is floored by the AIMD delay. A domain that just pushed back stays slow <em>even inside a burst</em> — the pacer shapes the texture, the controller holds the safety margin.</p>
+  </div>
+
+  <!-- ==================== 09 WAF STATE ==================== -->
+  <div class="block">
+    <h2><span class="no">09</span>The WAF State Filter — Leave Before the 403, Not After</h2>
+    <div class="why">Why a block is the most expensive possible measurement</div>
+    <p>A 403 is information — but it is the most expensive kind: you paid a burn identity + possible escalation + log noise to learn it. Targets telegraph before they block: latencies creep, soft challenges appear, error mixes shift. We fold those cheap signals into a single state estimate in <b>log-odds space</b>:</p>
+    <div class="eq-cap">EQ. 9.1 — The state update (log-odds of "this domain is about to bite")</div>
+    <div class="eq">ℓ ← clamp(ℓ + <span class="r">+1.2</span>·𝟙[403] + <span class="y">+0.7</span>·𝟙[429/spike] + <span class="g">−0.35</span>·𝟙[clean] , −4, +8)
+P(red) = 1 / (1 + e^{−ℓ})
+<span class="cm"># latency spike = latency > 2.5 × median of last 12</span>
+<span class="cm"># BREAKER: P(red) > 0.80  →  park the domain 20 minutes, pool moves on</span></div>
+    <p><b>Why log-odds and not a probability bar:</b> addition in log space is a Bayesian update for independent evidence — each signal nudges the estimate multiplicatively, early evidence moves it fast, and the clamp bounds pathological runs. <b>Why 0.8 and not 0.95:</b> the last stretch between "almost certain" and "certain" is where blocks actually print. Withdrawing at 0.8 means acting while the estimate is still cheap — that is the entire point of a <em>circuit breaker</em> in electrical engineering, borrowed wholesale: open the circuit on prediction, not on fault.</p>
+    <p><b>What it buys in numbers:</b> a typical escalation costs 2-3 burned identities; a park costs 20 quiet minutes. Against a 500-page target, trading a fifth of an hour for three identities is a profitable trade every single time.</p>
+  </div>
+
+  <!-- ==================== 10 FAILOVER ==================== -->
+  <div class="block">
+    <h2><span class="no">10</span>Failover — A Block Is a Statement About the Identity, Not the URL</h2>
+    <div class="why">Why retrying on the same IP is arithmetic, not persistence</div>
+    <p>When a block lands, the naive crawler retries identically — same IP, same fingerprint, same timing — and is surprised by the identical result. The engine instead rotates <em>immediately</em>, on the error path, before the retry fires:</p>
+    <div class="eq-cap">EQ. 10.1 — The failover jump and its invariant</div>
+    <div class="eq">skip = <span class="y">min(2, n − 1)</span>
+new_identity = pool[(i + skip) mod n]
+<span class="cm"># INVARIANT: (i + skip) mod n ≠ i  ⟺  skip mod n ≠ 0</span>
+<span class="cm">#            guaranteed because 1 ≤ skip ≤ n−1</span></div>
+    <p><b>Why min(2, n−1) exactly:</b> the upper bound is forced by the invariant — jumping exactly n laps back to the blocked identity. Taking 2 (when the pool allows) skips the <em>previous</em> identity too, which was likely blocked in the prior wave. A drift guard re-advances if the pinned identity somehow equals the blocked one — defensive coding for desync between the rotator's counter and the pinned entry.</p>
+    <p><b>Tor failover is NEWNYM:</b> when the blocked identity is the Tor endpoint, we don't skip — we signal the daemon (<code>SIGNAL NEWNYM</code> on the control port, cookie-auth first, password fallback). Tor rebuilds its circuit: new Guard→Middle→<b>Exit</b> path. With |E| ≈ 1000+ live exits, <span class="g">P(new exit ≠ old) ≈ 1 − 1/|E| ≈ 99.9%</span>. One control-port command converts "we are blocked" into "we are someone else."</p>
+    <p><b>Retry success is geometric</b> — if a random identity is clean with probability q:</p>
+    <div class="eq-cap">EQ. 10.2 — Geometric retry success</div>
+    <div class="eq">P(success within k tries) = <span class="g">1 − (1 − q)^k</span>       <span class="cm"># q=0.8: k=1→80%, k=2→96%, k=3→99.2%</span></div>
+  </div>
+
+  <!-- ==================== 11 HYBRID ==================== -->
+  <div class="block">
+    <h2><span class="no">11</span>Hybrid Pooling — When They Blocked Every Tor Exit</h2>
+    <div class="why">Why the answer to IP blocklists is diversification, not disguise</div>
+    <p>Hybrid mode merges the user's proxies and the Tor endpoint into <b>one</b> rotation pool. If a fraction f of the pool is blocked (say the target lists every public exit), a double failure requires two independent draws into the blocked set:</p>
+    <div class="eq-cap">EQ. 11.1 — The quadratic collapse of failure</div>
+    <div class="eq">P(request hits blocked)        = f
+P(<span class="r">retry also</span> hits blocked)    = <span class="y">f²</span>          <span class="cm"># independence does the work</span>
+
+<span class="cm"># f = 0.2 (every Tor exit listed, 20% of pool):</span>
+first draw fails  → 20%
+retry fails too   → <span class="g">4%</span>          <span class="cm"># vs 100% on a tor-only run</span></div>
+    <p><b>The thesis in one sentence:</b> independence between identities converts a <em>likely, repeated</em> failure into a <em>rare, quadratic</em> one. Tor's exit IPs stop being a single point of failure and become a per-request tax that shrinks with every retry. This — not browser disguise — is how you walk through a site that blanket-blocks Tor.</p>
+  </div>
+
+  <!-- ==================== 12 CACHE ==================== -->
+  <div class="block">
+    <h2><span class="no">12</span>Response Cache — The Best Request Is the One You Don't Send</h2>
+    <div class="why">Why ETag/304 beats every stealth trick on this poster</div>
+    <p>Every stealth mechanism manages the <em>probability</em> of getting caught. The cache removes the question. First fetch, store the body plus the target's validators (ETag, Last-Modified). Later runs send a conditional request:</p>
+    <div class="eq-cap">EQ. 12.1 — The two-tier hit model</div>
+    <div class="eq"><span class="g">FRESH (age < TTL)</span>   → serve from cache. <span class="y">zero requests leave the machine</span>
+<span class="b">STALE + validators</span>  → GET with If-None-Match / If-Modified-Since
+                      → 304 Not Modified: serve cached body (no content transfer)
+                      → 200: fresh body + new validators stored</div>
+    <p><b>Why 90% is the realistic number:</b> directory listings and business pages change on the scale of days; a re-run the next morning re-fetches almost nothing. Every cache hit is a request the WAF never saw — which improves every other number on this poster for free. The implementation stores a Selector-compatible wrapper so extraction code cannot tell a cache hit from a live fetch.</p>
+  </div>
+
+  <!-- ==================== 13 SITEMAP + PROBE ==================== -->
+  <div class="block">
+    <h2><span class="no">13</span>Sitemap-First &amp; Pre-Flight Probe — Cheaper Pages, Fewer Corpses</h2>
+    <div class="why">Two small ideas with outsized returns</div>
+    <p><b>Sitemap-first.</b> The search/listing pages of a directory are the most protected pages on the whole site — the WAF is tuned for exactly the crawling pattern they invite. But the same site publishes <code>sitemap.xml</code>: static, CDN-served, no protection, no rate limiting, containing hundreds of per-business detail URLs. Three requests against an unarmed file replace fifty against a wall. Include/exclude patterns and a domain filter keep the harvest clean.</p>
+    <p><b>Pre-flight probe.</b> Before the job: one cheap parallel request per proxy (8 workers). Dead entries leave the pool at t=0. Without this, dead proxies surface mid-run as mystery failures that <em>pollute the very statistics the ledger learns from</em> — a dead proxy looks identical to a blocked one to a Beta update. Clean inputs, clean inference.</p>
+  </div>
+
+  <!-- ==================== 14 MEMORY ==================== -->
+  <div class="block">
+    <h2><span class="no">14</span>Cross-Run Memory — The Ledger Lives in logy.db</h2>
+    <div class="why">Why this is the design decision everything else serves</div>
+    <p>All four ledgers — identity posteriors, domain delays, sticky maps, WAF states, response cache — persist in the same SQLite database the app already uses. The consequence is structural:</p>
+    <div class="pull">Run 10 starts where run 9 ended — not where run 1 started.</div>
+    <p>Yesterday's Yelp run learned which of your seven proxies get burned after twenty pages, at what delay the 403s begin, which exits are listable. Today's run loads all of it in one <code>_load()</code> and starts from experience. This is the difference between a tool and a system: a tool executes a strategy; a system <em>accumulates</em> one. Mainstream open-source scrapers ship engines; none of them ship memory.</p>
+  </div>
+
+  <!-- ==================== 15 LIMITS ==================== -->
+  <div class="block">
+    <h2><span class="no">15</span>Honest Limits — Where the Math Stops</h2>
+    <div class="why">Because a design doc without failure modes is a brochure</div>
+    <ul>
+      <li><b>Behavioral fingerprinting is out of scope.</b> Mouse entropy, request ordering, JS execution timing — the stealth browser's job (Scrapling's Chromium stealth, Cloudflare solving), not the ledger's. The two layers compose; they do not substitute.</li>
+      <li><b>The worst case is priced in.</b> A target that blocks every exit <em>and</em> every datacenter range leaves residential proxies as the only route. That is why the ops checklist leads with them.</li>
+      <li><b>Mild risks:</b> sticky identity concentrates evidence on one route (mitigated by the 30% churn); AIMD can be goaded into oscillation by a randomizing adversary (bounded by the clamp); the Beta posterior is only as honest as the block detector — which is why <code>looks_like_block()</code> is deliberately conservative and 404s never trigger it.</li>
+      <li><b>Native PoW solving (Anubis-style)</b> exists as an experimental module: detection + the sha256 leading-zero-bits solver, unit-tested against synthetic challenges. Wiring the full handshake needs live targets — declared as such in the code, not hidden.</li>
+    </ul>
+    <div class="work">
+      <div class="cap">The scorecard — what the equations buy, concretely</div>
+      <table>
+        <tr><th>Scenario</th><th>Without the engine</th><th>With the engine</th></tr>
+        <tr><td>Requests before first block (threshold m)</td><td class="bad">≈ m</td><td class="ok">≈ n·m</td></tr>
+        <tr><td>Max distinct exit IPs</td><td class="bad">1</td><td class="ok">1 + proxies + ~1000 exits</td></tr>
+        <tr><td>Retry success after a block</td><td class="bad">≈ 0% (same IP)</td><td class="ok">96% by k=2 (q=0.8)</td></tr>
+        <tr><td>Consecutive-failure probability (f=0.2)</td><td class="bad">20%</td><td class="ok">4%</td></tr>
+        <tr><td>Re-run request volume</td><td class="bad">100%</td><td class="ok">~10% (cache + sitemap)</td></tr>
+        <tr><td>Knowledge after run N</td><td class="bad">zero</td><td class="ok">all of it (sqlite ledger)</td></tr>
+      </table>
+    </div>
+    <div class="pull">Nothing here is clever. That is the point. Count, update, wait, walk away — executed without exception, forever, with memory.</div>
+  </div>
+
+  <footer>
+    <span>LOGY ENGINEERING POSTER SERIES · № 05 · 2026</span>
+    <span>MODULES: brain.py · anonymity.py · job_manager.py · scrapling_adapter.py</span>
+  </footer>
+</div>
+</body>
+</html>

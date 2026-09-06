@@ -1,0 +1,369 @@
+"""
+The Brain: LOGY's cross-run learning memory for identity rotation and
+per-domain pacing. This is the module that makes the crawler *learn*:
+
+- IdentityLedger  — per-identity Bayesian reputation (Beta-Bernoulli
+  posterior on "this identity gets blocked"), cooldown timers instead of
+  discard-on-block, per-domain sticky identities (a human doesn't change
+  IP every 3 seconds on one site), and a deterministic per-identity
+  persona (UA/locale/timezone) so an IP never ships with a mismatched
+  fingerprint.
+- DomainPolicy    — per-domain AIMD pacing (TCP-congestion-style speed
+  exploration), a WAF-pressure state estimate in log-odds space built
+  from cheap signals (latency spikes, 429s, challenges), and a circuit
+  breaker that PARKS a hardened domain before the official 403 lands.
+
+All state survives across jobs in logy.db (identity_stats / domain_stats /
+sticky_identities / response_cache tables) — run N learns from run N-1.
+
+Everything here is deliberately dependency-free (no Qt, no Scrapling) and
+single-threaded-by-convention: the scrape worker is the only caller, so
+no locks are needed beyond sqlite's own serialization (Database already
+serializes access with an RLock).
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import random
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import urlparse
+
+# ---------------------------------------------------------------- personas
+# Small pool of real, modern, internally-consistent browser profiles. A
+# persona is picked DETERMINISTICALLY from the identity key's hash, so the
+# same identity always presents the same fingerprint (a new IP with the
+# same old fingerprint is a red flag; a stable IP+persona pair reads as
+# one traveling human).
+_PERSONAS = [
+    {"useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "locale": "en-US", "timezone_id": "America/New_York"},
+    {"useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36", "locale": "en-GB", "timezone_id": "Europe/London"},
+    {"useragent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "locale": "en-US", "timezone_id": "America/Chicago"},
+    {"useragent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36", "locale": "de-DE", "timezone_id": "Europe/Berlin"},
+    {"useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0", "locale": "fr-FR", "timezone_id": "Europe/Paris"},
+    {"useragent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "locale": "en-CA", "timezone_id": "America/Toronto"},
+    {"useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36", "locale": "es-ES", "timezone_id": "Europe/Madrid"},
+    {"useragent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36", "locale": "en-AU", "timezone_id": "Australia/Sydney"},
+]
+
+
+def persona_for(key: str) -> dict:
+    """Deterministic persona for an identity key — same key, same persona,
+    forever (that's the whole point)."""
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return dict(_PERSONAS[digest[0] % len(_PERSONAS)])
+
+
+def host_of(url: str) -> str:
+    """netloc of a URL — schemeless hosts ('x.com/page') get an implicit
+    scheme so urlparse's netloc parsing works."""
+    if "://" not in url:
+        url = "http://" + url
+    try:
+        return urlparse(url).netloc.lower()
+    except ValueError:
+        return url
+
+
+# ---------------------------------------------------------------- records
+@dataclass
+class IdentityStat:
+    key: str
+    successes: int = 0
+    blocks: int = 0
+    avg_latency: float = 0.0
+    blocked_until: float = 0.0        # cooldown expiry (epoch s); 0 = free
+    persona: dict = field(default_factory=dict)
+    last_used: float = 0.0
+
+    @property
+    def block_prob(self) -> float:
+        """Laplace-smoothed Beta posterior mean on P(block | this identity).
+        The +1/+2 prior says 'unknown identities start neutral, slightly
+        suspect' — a fresh identity with zero history isn't trusted at 100%."""
+        return (self.blocks + 1) / (self.successes + self.blocks + 2)
+
+    @property
+    def free(self) -> bool:
+        return time.time() >= self.blocked_until
+
+
+@dataclass
+class DomainStat:
+    host: str
+    delay_ms: float = 0.0             # AIMD state — the learned working rate
+    consecutive_blocks: int = 0
+    log_odds: float = -2.0            # WAF-pressure state; -2 ≈ P(red) ~12%
+    disabled_until: float = 0.0       # circuit breaker expiry (epoch s)
+    latencies: deque = field(default_factory=lambda: deque(maxlen=12))
+
+    @property
+    def red_prob(self) -> float:
+        return 1.0 / (1.0 + math.exp(-self.log_odds))
+
+
+# ---------------------------------------------------------------- brain
+class Brain:
+    """Owns all learned state. Construct one per job from the Database;
+    stats persist in logy.db so later jobs inherit everything learned."""
+
+    # --- tuning constants (kept explicit, they ARE the algorithm knobs) ---
+    COOLDOWN_S = 300.0                 # block → 5 min on the bench, not discarded
+    STICKINESS = 0.7                   # P(reuse the domain's known-good identity)
+    AIMD_DOWN = 0.9                    # success → multiply delay (speed up)
+    AIMD_UP = 2.0                      # block → multiply delay (slow down)
+    AIMD_MIN_MS, AIMD_MAX_MS = 250.0, 30_000.0
+    AIMD_START_MS = 1_500.0
+    LOGIT_YELLOW = 0.7                 # soft signal (429/challenge/spike)
+    LOGIT_RED = 1.2                    # hard signal (403/blocked)
+    LOGIT_GREEN = -0.35                # clean success decay
+    BREAKER_THRESHOLD = 0.8            # P(red) above this → park the domain
+    BREAKER_PARK_S = 1200.0            # 20 min cool-off
+    LATENCY_SPIKE_X = 2.5              # latency > 2.5× recent median = yellow
+
+    _TABLES = """
+    CREATE TABLE IF NOT EXISTS identity_stats (
+        key TEXT PRIMARY KEY, successes INTEGER DEFAULT 0, blocks INTEGER DEFAULT 0,
+        avg_latency REAL DEFAULT 0, blocked_until REAL DEFAULT 0,
+        persona TEXT DEFAULT '', last_used REAL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS domain_stats (
+        host TEXT PRIMARY KEY, delay_ms REAL DEFAULT 0, consecutive_blocks INTEGER DEFAULT 0,
+        log_odds REAL DEFAULT -2, disabled_until REAL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS sticky_identities (
+        host TEXT PRIMARY KEY, identity_key TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS response_cache (
+        url TEXT PRIMARY KEY, etag TEXT DEFAULT '', last_modified TEXT DEFAULT '',
+        body TEXT DEFAULT '', fetched_at REAL DEFAULT 0);
+    """
+
+    def __init__(self, db):
+        """db: app.core.storage.db.Database (thread-safe via its RLock)."""
+        self.db = db
+        with db.cursor() as cur:
+            cur.executescript(self._TABLES)
+        self._identities: dict[str, IdentityStat] = {}
+        self._domains: dict[str, DomainStat] = {}
+        self._sticky: dict[str, str] = {}
+        self._load()
+
+    # ---------------- persistence ----------------
+    def _load(self):
+        with self.db.cursor() as cur:
+            for row in cur.execute("SELECT * FROM identity_stats").fetchall():
+                stat = IdentityStat(
+                    key=row["key"], successes=row["successes"], blocks=row["blocks"],
+                    avg_latency=row["avg_latency"], blocked_until=row["blocked_until"],
+                    persona={}, last_used=row["last_used"])
+                stat.persona = persona_for(stat.key)
+                self._identities[stat.key] = stat
+            for row in cur.execute("SELECT * FROM domain_stats").fetchall():
+                stat = DomainStat(host=row["host"], delay_ms=row["delay_ms"],
+                                  consecutive_blocks=row["consecutive_blocks"],
+                                  log_odds=row["log_odds"], disabled_until=row["disabled_until"])
+                self._domains[stat.host] = stat
+            for row in cur.execute("SELECT * FROM sticky_identities").fetchall():
+                self._sticky[row["host"]] = row["identity_key"]
+
+    def _save_identity(self, s: IdentityStat):
+        with self.db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO identity_stats(key, successes, blocks, avg_latency, blocked_until, persona, last_used) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET successes=?, blocks=?, avg_latency=?, "
+                "blocked_until=?, persona=?, last_used=?",
+                (s.key, s.successes, s.blocks, s.avg_latency, s.blocked_until, "1", s.last_used,
+                 s.successes, s.blocks, s.avg_latency, s.blocked_until, "1", s.last_used))
+
+    def _save_domain(self, s: DomainStat):
+        with self.db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO domain_stats(host, delay_ms, consecutive_blocks, log_odds, disabled_until) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET delay_ms=?, consecutive_blocks=?, "
+                "log_odds=?, disabled_until=?",
+                (s.host, s.delay_ms, s.consecutive_blocks, s.log_odds, s.disabled_until,
+                 s.delay_ms, s.consecutive_blocks, s.log_odds, s.disabled_until))
+
+    def _save_sticky(self, host: str, key: str):
+        with self.db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sticky_identities(host, identity_key) VALUES(?,?) "
+                "ON CONFLICT(host) DO UPDATE SET identity_key=?",
+                (host, key, key))
+
+    # ---------------- identity selection ----------------
+    def identity(self, key: str) -> IdentityStat:
+        stat = self._identities.get(key)
+        if stat is None:
+            stat = IdentityStat(key=key, persona=persona_for(key))
+            self._identities[key] = stat
+        return stat
+
+    def domain(self, host: str) -> DomainStat:
+        stat = self._domains.get(host)
+        if stat is None:
+            stat = DomainStat(host=host, delay_ms=self.AIMD_START_MS)
+            self._domains[stat.host] = stat
+        return stat
+
+    def pick(self, pool: list[str], host: str) -> str:
+        """Weighted, cooldown-aware, sticky-aware identity choice.
+
+        - cooled identities (blocked_until in the future) are excluded; if
+          EVERYTHING is cooled we take the one whose bench time ends first
+          rather than pick nothing.
+        - with probability STICKINESS the domain's known identity is reused
+          when still eligible (humans don't re-IP mid-session).
+        - otherwise proportional sampling on (1 − block_prob): a 95%-clean
+          identity carries ~10× the load of a 50% one."""
+        if not pool:
+            raise ValueError("empty identity pool")
+        eligible = [k for k in pool if self.identity(k).free]
+        if not eligible:
+            # all on the bench: ride with the soonest-to-free identity
+            eligible = sorted(pool, key=lambda k: self.identity(k).blocked_until)
+            return eligible[0]
+
+        sticky_key = self._sticky.get(host)
+        if sticky_key and sticky_key in eligible and random.random() < self.STICKINESS:
+            return sticky_key
+
+        weights = [(1.0 - self.identity(k).block_prob) for k in eligible]
+        return random.choices(eligible, weights=weights, k=1)[0]
+
+    # ---------------- outcome recording ----------------
+    def record(self, key: str, host: str, blocked: bool, latency_s: float = 0.0):
+        """THE learning step. One call updates: the identity's Beta
+        posterior + cooldown, the sticky map, and — via _pressure() — the
+        domain's WAF state, AIMD delay and circuit breaker."""
+        ident = self.identity(key)
+        now = time.time()
+        ident.last_used = now
+        if blocked:
+            ident.blocks += 1
+            ident.blocked_until = now + self.COOLDOWN_S
+        else:
+            ident.successes += 1
+            if latency_s > 0:
+                ident.avg_latency = (ident.avg_latency * (ident.successes - 1) + latency_s) / ident.successes
+        self._save_identity(ident)
+
+        if not blocked:
+            self._sticky[host] = key
+            self._save_sticky(host, key)
+        self._pressure(host, blocked, latency_s)
+
+    # ---------------- per-domain pacing & WAF state ----------------
+    def _pressure(self, host: str, blocked: bool, latency_s: float):
+        dom = self.domain(host)
+        if latency_s > 0:
+            dom.latencies.append(latency_s)
+
+        if blocked:
+            dom.consecutive_blocks += 1
+            dom.delay_ms = min(dom.delay_ms * self.AIMD_UP, self.AIMD_MAX_MS)
+            dom.log_odds = min(dom.log_odds + self.LOGIT_RED, 8.0)
+        else:
+            dom.consecutive_blocks = 0
+            dom.delay_ms = max(dom.delay_ms * self.AIMD_DOWN, self.AIMD_MIN_MS)
+            spike = (len(dom.latencies) >= 4
+                     and latency_s > self.LATENCY_SPIKE_X * _median(list(dom.latencies)[:-1]))
+            dom.log_odds = max(dom.log_odds + (self.LOGIT_YELLOW if spike else self.LOGIT_GREEN), -4.0)
+
+        if dom.red_prob > self.BREAKER_THRESHOLD:
+            dom.disabled_until = time.time() + self.BREAKER_PARK_S
+        self._save_domain(dom)
+
+    def gate(self, url_or_host: str) -> bool:
+        """Circuit breaker: False while the domain is parked (P(red) got too
+        high). The job loop requeues parked URLs instead of hammering."""
+        host = host_of(url_or_host) if "/" in url_or_host else url_or_host
+        return time.time() >= self.domain(host).disabled_until
+
+    def delay_s(self, host: str) -> float:
+        """Current AIMD delay for the domain, in seconds."""
+        return self.domain(host).delay_ms / 1000.0
+
+    def unlock(self, host: str):
+        dom = self.domain(host)
+        dom.disabled_until = 0.0
+        dom.log_odds = -2.0
+        self._save_domain(dom)
+
+    # ---------------- response cache (conditional requests) ----------------
+    def cache_get(self, url: str, ttl_s: float) -> Optional[tuple[str, dict]]:
+        """Returns (html, conditional_headers) when a usable entry exists:
+        - fresh within ttl → (html, {}) — no network needed at all
+        - stale but has validators → (html, {If-None-Match/If-Modified-Since})
+          so the caller can revalidate with a cheap 304 instead of a full GET
+        - nothing → None"""
+        with self.db.cursor() as cur:
+            row = cur.execute("SELECT etag, last_modified, body, fetched_at FROM response_cache WHERE url=?", (url,)).fetchone()
+        if not row or not row["body"]:
+            return None
+        headers = {}
+        if row["etag"]:
+            headers["If-None-Match"] = row["etag"]
+        if row["last_modified"]:
+            headers["If-Modified-Since"] = row["last_modified"]
+        if time.time() - row["fetched_at"] < ttl_s:
+            return row["body"], {}          # fresh: zero-request hit
+        return row["body"], headers         # stale: revalidate
+
+    def cache_put(self, url: str, html: str, etag: str = "", last_modified: str = ""):
+        with self.db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO response_cache(url, etag, last_modified, body, fetched_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(url) DO UPDATE SET etag=?, last_modified=?, body=?, fetched_at=?",
+                (url, etag, last_modified, html, time.time(),
+                 etag, last_modified, html, time.time()))
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+# ---------------------------------------------------------------- pacer
+class BurstPacer:
+    """Human-burst request shaping via a Poisson CLUSTER process - the
+    classic model for bursty human traffic (page load → rapid follow-ups
+    → silence). Uniform random sleeps produce statistically obvious
+    inter-arrival gaps; this produces the two-regime shape real sessions
+    have:
+
+        quiet stretch: gaps ~ Exp(quiet_rate)   (seconds to tens of seconds)
+        burst:         gaps ~ Exp(burst_rate)   (a second or two, back to back)
+
+    with probabilistic transitions between the regimes. Related to the
+    Hawkes self-exciting family (bursts = excitation, silence = decayed
+    excitation) but as an explicit two-regime process it stays simple,
+    inspectable and testable - no hidden clock state to desync.
+    """
+
+    def __init__(self, burst_rate: float = 0.8, quiet_rate: float = 0.05,
+                 p_enter: float = 0.15, p_exit: float = 0.08,
+                 max_delay_s: float = 90.0):
+        # burst_rate  : events/sec inside a burst  (mean gap ~1.25s)
+        # quiet_rate  : events/sec while browsing slowly (mean gap ~20s)
+        self.burst_rate = burst_rate
+        self.quiet_rate = quiet_rate
+        self.p_enter, self.p_exit = p_enter, p_exit
+        self.max_delay_s = max_delay_s
+        self._in_burst = False
+
+    def sample(self, floor_s: float = 0.0) -> float:
+        """Next inter-arrival gap in seconds (≥ floor_s, ≤ max_delay_s)."""
+        if self._in_burst:
+            gap = random.expovariate(self.burst_rate)
+            if random.random() < self.p_exit:
+                self._in_burst = False    # the browsing spurt is over
+        else:
+            gap = random.expovariate(self.quiet_rate)
+            if random.random() < self.p_enter:
+                self._in_burst = True     # a new burst of page loads starts
+        return max(min(gap, self.max_delay_s), floor_s)

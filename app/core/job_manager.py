@@ -24,10 +24,11 @@ from PySide6.QtCore import QObject, QThread, Signal
 from app.core.engine import scrapling_adapter as engine
 from app.core.engine import ai_extractor
 from app.core.engine import anonymity
+from app.core.engine import brain as brain_mod
 from app.core.engine.dedupe import fingerprint_lead
 from app.core.engine.extractor import extract_fields, extract_records, ExtractionError
 from app.core.engine.qualifier import qualify_html
-from app.core.models import ExtractionField, JobStatus, TargetConfig, ScrapeOptions, LogLevel
+from app.core.models import ExtractionField, FetcherMode, JobStatus, TargetConfig, ScrapeOptions, LogLevel
 from app.core.storage.db import Database
 from app.core.storage.secrets import SecretStore
 
@@ -93,6 +94,14 @@ class ScrapeJobWorker(QObject):
         self._rotator = None
         self._request_seq = 0
 
+        # Intelligence layer (app/core/engine/brain.py): cross-run identity
+        # reputation + per-domain pacing + WAF breaker + response cache.
+        # Created lazily in run() only when at least one feature is on,
+        # so a plain job touches none of this.
+        self._brain: Optional[brain_mod.Brain] = None
+        self._pacer: Optional[brain_mod.BurstPacer] = None
+        self._requeues: dict[str, int] = {}   # parked-domain requeue guard
+
         self._stop_requested = False
         self._pause_requested = False
 
@@ -124,6 +133,9 @@ class ScrapeJobWorker(QObject):
             self.status_changed.emit(JobStatus.RUNNING.value)
             self._emit_log(LogLevel.INFO, "بدء عملية الاستخراج")
             self._check_tor_at_start()
+            self._setup_brain()
+            self._probe_proxies_at_start()
+            self._expand_sitemap()
 
             queue: deque[tuple[str, int]] = deque((u, 0) for u in self.target.start_urls)  # (url, depth)
             seen: set[str] = set(self.target.start_urls)
@@ -143,28 +155,47 @@ class ScrapeJobWorker(QObject):
                     self._emit_log(LogLevel.INFO, f"تم الوصول للحد الأقصى للصفحات ({self.target.max_pages})")
                     break
 
-                # "Delay between requests" (Advanced Options) was collected
-                # from the UI (new_scrape.py's delay_spin -> options.delay_ms)
-                # but never actually used anywhere in this loop - a real bug,
-                # not just cosmetic: it's exactly what made a 500-page Yelp
-                # run hammer yelp.com back-to-back with zero pacing between
-                # requests, which is a big part of why Yelp's WAF started
-                # returning HTTP 403 on nearly every request after the first
-                # few dozen (see the 91/91-failed run this was reported
-                # against). Runs on every iteration (not skipped on an error
-                # continue below) so a page that just got 403'd doesn't
-                # immediately get hammered again on the very next URL either.
-                if not first_page and self.options.delay_ms > 0:
+                # Per-request identity + pacing need the URL's host, so the
+                # pop happens FIRST now (the old code slept before popping -
+                # fine for a flat global delay, wrong for per-domain AIMD).
+                # The historical bug context: "delay between requests" was
+                # collected from the UI but never used anywhere in this loop
+                # (a 500-page Yelp run hammered yelp.com back-to-back - a big
+                # part of why its WAF returned HTTP 403 on nearly every
+                # request after the first few dozen; the 91/91-failed run).
+                url, depth = queue.popleft()
+
+                # Pacing: with the brain active, the per-domain LEARNED delay
+                # (AIMD) and/or the human-burst pacer own this sleep instead
+                # of the flat options.delay_ms. Runs on every iteration so a
+                # page that just got 403'd doesn't get hammered again next.
+                if not first_page and not self._pacing_sleep(url):
                     self._interruptible_sleep(self.options.delay_ms / 1000.0)
                 first_page = False
                 if self._stop_requested:
                     break  # Stop was clicked during the delay itself
 
-                url, depth = queue.popleft()
+                # Circuit breaker: a domain whose WAF-pressure estimate went
+                # red is PARKED - requeue its URLs for after the park window
+                # instead of burning the identity pool against a wall.
+                if self._brain is not None and not self._brain.gate(url):
+                    self._requeues[url] = self._requeues.get(url, 0) + 1
+                    if self._requeues[url] > 3:
+                        self._emit_log(LogLevel.WARNING, f"تجاوز الحد الأقصى للتأجيل - تخطي {url}")
+                        self._requeues[url] = 0
+                        pages_done += 1
+                        continue
+                    queue.append((url, depth))
+                    self._emit_log(LogLevel.INFO,
+                                   f"النطاق تحت ضغط حماية عالي - تأجيل {url} "
+                                   f"ل~{brain_mod.Brain.BREAKER_PARK_S // 60} دقيقة")
+                    self._interruptible_sleep(30)
+                    continue
+
                 # Pick this request's identity BEFORE fetching: rotate the
                 # proxy / Tor circuit so consecutive requests don't leave
                 # from the same IP (see _prepare_proxy()).
-                self._prepare_proxy()
+                self._prepare_proxy(url)
                 # Multi-source runs: pick this URL's own container/fields/
                 # detail_config before fetching+extracting it - see the
                 # source_profiles docstring in __init__ above. A no-op
@@ -283,6 +314,15 @@ class ScrapeJobWorker(QObject):
         return bool(proxy.mode == "hybrid" and proxy.proxies
                     and proxy.proxies[0].startswith("socks5://127.0.0.1:"))
 
+    def _current_identity_key(self) -> str:
+        """The Brain's key for whatever identity _prepare_proxy() just picked.
+        Tor identities are tracked per-endpoint (their reputation is really
+        the exit-node pool's), proxies are tracked by their own string."""
+        proxy = self.options.proxy
+        if self._tor_picked():
+            return f"tor@{proxy.tor_socks_port}"
+        return proxy.proxies[0] if proxy.proxies else "direct"
+
     def _build_hybrid_pool(self) -> list[str]:
         """One rotation pool out of the user's proxies + the Tor endpoint.
         This is what lets a site that blocks Tor exit IPs be scraped
@@ -294,6 +334,129 @@ class ScrapeJobWorker(QObject):
         if tor_url not in pool:
             pool.append(tor_url)
         return pool
+
+    def _identity_pool(self) -> list[str]:
+        """The active identity pool for the current proxy mode."""
+        proxy = self.options.proxy
+        if proxy.mode in ("list", "rotating"):
+            return [p for p in self._proxy_pool if p.strip()]
+        if proxy.mode == "hybrid":
+            return self._build_hybrid_pool()
+        if proxy.mode == "tor":
+            return [f"tor@{proxy.tor_socks_port}"]
+        return []
+
+    def _setup_brain(self):
+        """Create the Brain lazily: only when at least one intelligence
+        feature can actually use it. The Brain LOADS everything previous
+        jobs learned about these identities/domains from logy.db - that
+        inheritance is the whole point of cross-run memory."""
+        opts = self.options
+        if not (opts.use_identity_memory or opts.use_response_cache
+                or opts.pacing_mode in ("aimd", "burst")):
+            return
+        try:
+            self._brain = brain_mod.Brain(self.db)
+        except Exception as e:
+            self._emit_log(LogLevel.WARNING, f"تعذر تهيئة ذاكرة التعلم - الاستمرار بدونها: {e}")
+            return
+        if opts.use_identity_memory and self._identity_pool():
+            self._emit_log(LogLevel.INFO,
+                           f"ذاكرة الهويات مفعّلة: {len(self._identity_pool())} هوية في الدورة "
+                           "(سمعة كل هوية محفوظة عبر الجريات)")
+        if opts.pacing_mode == "burst":
+            self._pacer = brain_mod.BurstPacer()
+            self._emit_log(LogLevel.INFO, "وضع النبض البشري (burst) مفعّل: إيقاع الطلبات بيتولّد من عملية ذاتية الاستثارة")
+        elif opts.pacing_mode == "aimd":
+            self._emit_log(LogLevel.INFO, "الوضع التكيفي (AIMD) مفعّل: السرعة بتتظبط لكل نطاق تلقائياً")
+
+    def _probe_proxies_at_start(self):
+        """Pre-flight: one cheap parallel request per proxy BEFORE the job,
+        so dead entries leave the pool at t=0 instead of surfacing mid-run
+        as mystery failures that pollute the identity statistics."""
+        proxy = self.options.proxy
+        candidates = [p for p in self._proxy_pool if p.strip()] if proxy.mode in ("list", "rotating", "hybrid") else []
+        if not candidates:
+            return
+        self._emit_log(LogLevel.INFO, f"فحص صحة {len(candidates)} بروكسي قبل البدء...")
+        alive, dead = engine.probe_proxies(candidates)
+        if dead:
+            self._proxy_pool = alive
+            if self._rotator is not None:
+                self._rotator = None    # force rebuild from the pruned pool
+            self._emit_log(LogLevel.WARNING,
+                           f"{len(dead)} بروكسي ميت اتشال من الدورة قبل البدء - الباقي {len(alive)}")
+        else:
+            self._emit_log(LogLevel.SUCCESS, f"كل البروكسيات ({len(alive)}) شغالة")
+
+    def _expand_sitemap(self):
+        """Sitemap-first discovery: pull crawl targets from the target's own
+        sitemap.xml (static, unprotected, CDN-served) instead of fighting
+        for them on protected search pages. Runs before the main loop and
+        MERGES results into start_urls (originals kept as fallback)."""
+        if not self.options.discover_sitemap or not self.target.start_urls:
+            return
+        self._emit_log(LogLevel.INFO, "جاري اكتشاف الروابط من sitemap.xml...")
+
+        def _fetch_body(u: str) -> Optional[str]:
+            try:
+                opts = ScrapeOptions(fetcher_mode=FetcherMode.FAST_HTTP, timeout_s=15, retries=0)
+                fr = engine.fetch_one(u, opts, should_stop=lambda: self._stop_requested)
+                return engine.get_html(fr.page)
+            except Exception:
+                return None
+
+        from app.core.engine import sitemap as sitemap_mod
+        try:
+            found = sitemap_mod.discover_sitemap_urls(
+                self.target.start_urls, _fetch_body,
+                include_patterns=self.target.include_patterns,
+                exclude_patterns=self.target.exclude_patterns,
+                max_urls=max(self.target.max_pages, 200))
+        except Exception as e:
+            self._emit_log(LogLevel.WARNING, f"تعذر قراءة الـ sitemap: {e}")
+            return
+        if found:
+            merged = list(dict.fromkeys(self.target.start_urls + found))
+            self.target.start_urls = merged
+            self._emit_log(LogLevel.SUCCESS,
+                           f"sitemap أضاف {len(found)} رابط من صفحات الأعمال - إجمالي الطابور {len(merged)}")
+        else:
+            self._emit_log(LogLevel.INFO, "مفيش روابط إضافية من الـ sitemap - الطابور زي ما هو")
+
+    def _pacing_sleep(self, url: str) -> bool:
+        """True when the intelligence layer owned this sleep (brain modes),
+        False → caller falls back to the flat options.delay_ms sleep.
+        Effective wait = the per-domain AIMD delay, optionally wrapped in
+        the burst pacer's self-exciting gap (with AIMD as the floor, so a
+        domain that just pushed back stays slowed regardless of bursts)."""
+        if self._brain is None:
+            return False
+        host = brain_mod.host_of(url)
+        aimd_s = self._brain.delay_s(host)
+        if self._pacer is not None:
+            self._interruptible_sleep(self._pacer.sample(floor_s=aimd_s))
+        elif aimd_s > 0:
+            self._interruptible_sleep(aimd_s)
+        else:
+            return False
+        return True
+
+    def _record_outcome(self, url: str, blocked: bool, latency_s: float = 0.0, error: str = ""):
+        """Feed the fetch result back into the Brain: Beta posterior update,
+        cooldown on block, AIMD step, WAF log-odds, breaker check. When the
+        experimental PoW option is on and the block reason smells like a JS
+        challenge, say so in the log (full native handshake is staged in
+        app/core/engine/pow_solver.py and needs a live target to tune)."""
+        if self._brain is None:
+            return
+        host = brain_mod.host_of(url)
+        key = self._current_identity_key()
+        self._brain.record(key, host, blocked, latency_s)
+        if blocked and self.options.solve_pow and "challenge" in error.lower():
+            self._emit_log(LogLevel.INFO,
+                           f"الحظر على {url} شكله تحدي JS proof-of-work - "
+                           "المحلل التجريبي موجود في pow_solver.py ومحتاج ضبط على هدف حقيقي")
 
     def _rotate_identity_on_block(self, url: str, reason: str) -> None:
         """Called when a fetch comes back blocked (403/429/Cloudflare...).
@@ -342,7 +505,7 @@ class ScrapeJobWorker(QObject):
                 proxy.proxies = [new]
                 self._emit_log(LogLevel.INFO, f"بلوك ({url}) - تبديل البروكسي إلى: {new}")
 
-    def _prepare_proxy(self) -> None:
+    def _prepare_proxy(self, url: str = "") -> None:
         """Runs before EVERY fetch: makes options.proxy.proxies exactly one
         entry - the one this particular request should use.
 
@@ -359,6 +522,11 @@ class ScrapeJobWorker(QObject):
           periodic NEWNYM rotation whenever Tor is the picked identity.
         - "none"/"single": unchanged (single entry or empty already).
 
+        With identity memory active (brain), list/hybrid picking upgrades
+        from blind cyclic to the Brain's weighted, cooldown-aware,
+        sticky-per-domain choice (see brain.Brain.pick) and the request's
+        persona (UA/locale/timezone) is pinned to the chosen identity.
+
         Mutating self.options (instead of threading a separate proxy arg
         through fetch_one) is deliberate: options.proxy is already the
         single source the adapter and every enrichment path (qualifier,
@@ -366,17 +534,24 @@ class ScrapeJobWorker(QObject):
         them."""
         proxy = self.options.proxy
         if proxy.mode in ("list", "rotating") and len(self._proxy_pool) > 1:
-            if self._rotator is None:
-                self._rotator = anonymity.CyclicProxyRotator(self._proxy_pool)
-            proxy.proxies = [self._rotator.next()]
+            if self._brain is not None and self.options.use_identity_memory:
+                proxy.proxies = [self._brain.pick(self._identity_pool(), brain_mod.host_of(url))]
+            else:
+                if self._rotator is None:
+                    self._rotator = anonymity.CyclicProxyRotator(self._proxy_pool)
+                proxy.proxies = [self._rotator.next()]
+            self._sync_persona()
             return
         if proxy.mode in ("tor", "hybrid"):
             if proxy.mode == "hybrid":
                 pool = self._build_hybrid_pool()
                 if len(pool) > 1:
-                    if self._rotator is None or len(self._rotator) != len(pool):
-                        self._rotator = anonymity.CyclicProxyRotator(pool)
-                    proxy.proxies = [self._rotator.next()]
+                    if self._brain is not None and self.options.use_identity_memory:
+                        proxy.proxies = [self._brain.pick(pool, brain_mod.host_of(url))]
+                    else:
+                        if self._rotator is None or len(self._rotator) != len(pool):
+                            self._rotator = anonymity.CyclicProxyRotator(pool)
+                        proxy.proxies = [self._rotator.next()]
                 else:
                     proxy.proxies = [pool[0]]
             else:
@@ -387,6 +562,16 @@ class ScrapeJobWorker(QObject):
                 ok, reason = anonymity.rotate_tor_circuit(proxy.tor_control_port, proxy.tor_control_password)
                 level = LogLevel.SUCCESS if ok else LogLevel.WARNING
                 self._emit_log(level, f"تدوير هوية Tor ({self._request_seq}): {reason}")
+            self._sync_persona()
+
+    def _sync_persona(self):
+        """Pin the picked identity's persona onto options so the adapter
+        ships this request as the SAME 'person' every time this identity
+        is used - IP + fingerprint stay a consistent pair."""
+        if self._brain is None or not self.options.use_identity_memory:
+            self.options.persona = {}
+            return
+        self.options.persona = self._brain.identity(self._current_identity_key()).persona
 
     def _check_tor_at_start(self) -> None:
         """One-time startup sanity check for tor mode: without a listening
@@ -420,12 +605,20 @@ class ScrapeJobWorker(QObject):
         for attempt in range(1, attempts + 1):
             if self._stop_requested:
                 return None, "أوقفه المستخدم"
+            started = time.time()
             try:
                 # should_stop lets a hung/slow fetch be interrupted within
                 # ~0.25s of a Stop click, instead of only being checked
                 # between whole retry attempts (which could be up to
                 # timeout+15s apart) - that gap was why Stop looked broken.
-                return engine.fetch_one(url, self.options, should_stop=lambda: self._stop_requested), None
+                result = engine.fetch_one(url, self.options,
+                                          should_stop=lambda: self._stop_requested,
+                                          cache=self._brain)
+                if self._brain is not None:
+                    # Learning step: success feeds the Beta posterior, AIMD
+                    # speed-up and WAF-state decay for this domain+identity.
+                    self._record_outcome(url, blocked=False, latency_s=time.time() - started)
+                return result, None
             except engine.FetchCancelled:
                 return None, "أوقفه المستخدم"
             except engine.FetchError as e:
@@ -436,11 +629,18 @@ class ScrapeJobWorker(QObject):
                     # just gets blocked again (this was Yelp's whole 403
                     # wall). Rotate the identity first, THEN retry.
                     if anonymity.looks_like_block(last_error):
+                        if self._brain is not None:
+                            self._record_outcome(url, blocked=True,
+                                                 latency_s=time.time() - started, error=last_error)
                         self._rotate_identity_on_block(url, last_error)
                     self._emit_log(LogLevel.WARNING, f"إعادة محاولة {attempt}/{attempts - 1} لـ {url}: {last_error}")
                     self._interruptible_sleep(min(2 ** attempt, 10))
                     if self._stop_requested:
                         return None, "أوقفه المستخدم"
+                elif self._brain is not None and anonymity.looks_like_block(last_error):
+                    # final failed attempt still counts as a block signal
+                    self._record_outcome(url, blocked=True,
+                                         latency_s=time.time() - started, error=last_error)
             except RuntimeError as e:  # Scrapling not installed
                 return None, str(e)
         return None, last_error

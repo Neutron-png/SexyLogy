@@ -160,6 +160,28 @@ class ScrapeOptions:
     # re-running the same scrape/niche later is to find NEW leads, not to
     # keep re-collecting the same ones.
     skip_duplicate_leads: bool = True
+    # --- Intelligence (app/core/engine/brain.py) ---
+    # pacing_mode: "fixed" = the plain delay_ms sleep (classic behavior);
+    # "aimd"  = per-domain learned delay (×0.9 on success, ×2 on block);
+    # "burst" = human-burst shaping (self-exciting point process sampled
+    #           with Ogata thinning) with the AIMD delay as a floor.
+    pacing_mode: str = "fixed"
+    # Identity memory: Bayesian per-identity reputation (Beta posterior),
+    # 5-min cooldowns instead of discard-on-block, sticky per-domain
+    # identities, deterministic per-identity personas. Persisted in
+    # logy.db so later jobs inherit everything this job learned.
+    use_identity_memory: bool = True
+    # Response cache for FAST_HTTP: ETag/Last-Modified conditional requests;
+    # fresh entries return without touching the network at all.
+    use_response_cache: bool = False
+    cache_ttl_s: int = 3600
+    # Discover start URLs from the site's sitemap.xml before crawling.
+    discover_sitemap: bool = False
+    # Experimental: detect JS proof-of-work walls (Anubis-style) natively.
+    solve_pow: bool = False
+    # Per-request persona (UA/locale/timezone), set by the worker for the
+    # CURRENT identity exactly like proxies[0] - never logged/exported.
+    persona: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

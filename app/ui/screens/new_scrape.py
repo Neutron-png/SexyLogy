@@ -131,10 +131,13 @@ class NewScrapeScreen(QWidget):
 
         self.options_section = self._build_options_section()
         self.proxy_section = self._build_proxy_section()
+        self.intel_section = self._build_intelligence_section()
         config_layout.addWidget(self.options_section)
         config_layout.addWidget(self.proxy_section)
+        config_layout.addWidget(self.intel_section)
         self.options_section.setVisible(False)
         self.proxy_section.setVisible(False)
+        self.intel_section.setVisible(False)
 
         config_layout.addStretch(1)
 
@@ -299,6 +302,44 @@ class NewScrapeScreen(QWidget):
     def _toggle_advanced_sections(self, checked: bool):
         self.options_section.setVisible(checked)
         self.proxy_section.setVisible(checked)
+        self.intel_section.setVisible(checked)
+
+    # ------------------------------------------------------------------
+    # INTELLIGENCE (brain.py) - identity memory, pacing, cache, sitemap, PoW
+    # ------------------------------------------------------------------
+    def _build_intelligence_section(self) -> QWidget:
+        w, layout = card("Intelligence (يحفظ ويتعلم عبر الجريات)")
+        self.pacing_combo = QComboBox()
+        self.pacing_combo.addItems([
+            "Fixed delay (classic)",
+            "Adaptive - AIMD (يتعلم سرعة كل نطاق)",
+            "Human-burst (إيقاع بشري ذاتي الاستثارة)",
+        ])
+        layout.addWidget(self.pacing_combo)
+
+        self.identity_memory_chk = QCheckBox("Identity memory - سمعة كل هوية + cooldown + sticky per domain (محفوظة عبر الجريات)")
+        self.identity_memory_chk.setChecked(True)
+        layout.addWidget(self.identity_memory_chk)
+
+        self.response_cache_chk = QCheckBox("Response cache - ETag/304: الـ re-runs ميطلبش نفس الصفحات تاني")
+        layout.addWidget(self.response_cache_chk)
+
+        self.sitemap_chk = QCheckBox("Sitemap discovery - اجمع الروابط من sitemap.xml بدل صفحات البحث المحمية")
+        layout.addWidget(self.sitemap_chk)
+
+        self.pow_chk = QCheckBox("Detect JS proof-of-work walls (تجريبي)")
+        layout.addWidget(self.pow_chk)
+
+        note = QLabel(
+            "Identity memory بيحتفظ بسمعة كل هوية (Beta posterior) وبيتجنب المبلوكة 5 دقايق بدل ما يرميها، "
+            "وبيثبت هوية لكل نطاق زي البني آدم، وكل هوية ليها fingerprint ثابت (UA + لغة + توقيت).\n"
+            "AIMD: ×0.9 عند نجاح و×2 عند بلوك - بيلاقي السرعة المثالية لكل نطاق لوحده. "
+            "Human-burst: فترات الطلبات بتتشكل من عملية ذاتية الاستثارة (bursts + هدوء) بدل فواصل منتظمة مكشوفة."
+        )
+        note.setStyleSheet("color: #8B95A7; font-size: 11px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        return w
 
     # ------------------------------------------------------------------
     # SOURCES - "خليني اقدر من جوا اضيف مصادر جديدة": lets the user
@@ -1445,6 +1486,11 @@ class NewScrapeScreen(QWidget):
             ai_extraction=self._collect_ai_extraction() or AIExtractionConfig(enabled=False),
             owner_lookup_enabled=self.owner_lookup_chk.isChecked(),
             skip_duplicate_leads=self.skip_duplicates_chk.isChecked(),
+            pacing_mode=("fixed", "aimd", "burst")[self.pacing_combo.currentIndex()],
+            use_identity_memory=self.identity_memory_chk.isChecked(),
+            use_response_cache=self.response_cache_chk.isChecked(),
+            discover_sitemap=self.sitemap_chk.isChecked(),
+            solve_pow=self.pow_chk.isChecked(),
         )
 
     def _collect_container(self) -> dict | None:

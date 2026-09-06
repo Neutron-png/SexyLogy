@@ -24,11 +24,13 @@ does not claim to support it.
 from __future__ import annotations
 
 import concurrent.futures
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
 from app.core.engine import anonymity
+from app.core.engine import brain as brain_mod
 from app.core.models import FetcherMode, ScrapeOptions, ProxyConfig
 
 try:
@@ -52,6 +54,44 @@ class FetchError(Exception):
         self.url = url
         self.reason = reason
         super().__init__(f"{url}: {reason}")
+
+
+def _apply_persona_kwargs(fetcher_mode: FetcherMode, options: ScrapeOptions) -> dict:
+    """Identity persona → engine kwargs. Browser engines take useragent/
+    locale/timezone_id natively; FAST_HTTP gets the UA via headers (curl-cffi
+    generates its own browser headers for impersonation, so an explicit UA
+    must ride in the header dict, not a dedicated kwarg)."""
+    persona = options.persona or {}
+    if not persona:
+        return {}
+    if fetcher_mode == FetcherMode.FAST_HTTP:
+        return {"headers": {"User-Agent": persona["useragent"], **(options.headers or {})}}
+    kwargs: dict = {}
+    if persona.get("useragent"):
+        kwargs["useragent"] = persona["useragent"]
+    if persona.get("locale"):
+        kwargs["locale"] = persona["locale"]
+    if persona.get("timezone_id"):
+        kwargs["timezone_id"] = persona["timezone_id"]
+    return kwargs
+
+
+def probe_proxies(proxies: list[str], timeout_s: float = 8.0) -> tuple[list[str], list[str]]:
+    """Pre-flight parallel health probe: one cheap request per proxy before
+    the job starts, so dead entries are removed from the pool at t=0 instead
+    of being discovered mid-run as mystery failures. Returns (alive, dead)."""
+    def _probe(proxy: str) -> tuple[str, bool]:
+        try:
+            Fetcher.get("https://example.com", proxy=proxy, timeout=timeout_s, retries=0)
+            return proxy, True
+        except Exception:
+            return proxy, False
+
+    alive, dead = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(proxies)))) as pool:
+        for proxy, ok in pool.map(_probe, proxies):
+            (alive if ok else dead).append(proxy)
+    return alive, dead
 
 
 class FetchCancelled(FetchError):
@@ -159,15 +199,63 @@ def _get_fetch_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _fetch_executor
 
 
-def fetch_one(url: str, options: ScrapeOptions, should_stop=None) -> FetchResult:
+class _CachedPage:
+    """A zero-network page: wraps a Selector built from cached HTML so every
+    downstream consumer (extractor.css/xpath, extract_links, get_html) works
+    unchanged on a cache hit. status 200 by fiat - the content IS the page."""
+
+    def __init__(self, html: str, url: str):
+        from scrapling.parser import Selector
+        self._sel = Selector(content=html, url=url)
+        self._html = html
+        self.status = 200
+
+    def css(self, *a, **k):
+        return self._sel.css(*a, **k)
+
+    def xpath(self, *a, **k):
+        return self._sel.xpath(*a, **k)
+
+    @property
+    def html(self) -> str:
+        return self._html
+
+
+def _header_value(headers: Any, name: str) -> str:
+    try:
+        for k, v in dict(headers or {}).items():
+            if k.lower() == name.lower():
+                return str(v)
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_one(url: str, options: ScrapeOptions, should_stop=None, cache: Optional[brain_mod.Brain] = None) -> FetchResult:
     """
     Fetch a single URL using the fetcher mode selected in Step 3 of the
     New Scrape wizard. Raises FetchError on failure (timeout, connection
     error, HTTP error, blocked request) - the job manager turns that into
     a per-URL job error rather than crashing the run.
+
+    `cache` (optional, FAST_HTTP only): a Brain carrying the response cache.
+    Fresh entries return a zero-network _CachedPage; stale ones revalidate
+    with If-None-Match/If-Modified-Since and a 304 is served from cache.
     """
     require_scrapling()
     proxy = _proxy_kwarg(options.proxy, for_http=(options.fetcher_mode == FetcherMode.FAST_HTTP))
+    persona_kwargs = _apply_persona_kwargs(options.fetcher_mode, options)
+    use_cache = (cache is not None and options.use_response_cache
+                 and options.fetcher_mode == FetcherMode.FAST_HTTP)
+
+    # ---- cache fast path: fresh entry = zero requests ----
+    if use_cache:
+        hit = cache.cache_get(url, options.cache_ttl_s)
+        if hit is not None:
+            html, cond_headers = hit
+            if not cond_headers:
+                return FetchResult(url=url, page=_CachedPage(html, url), status=200, ok=True)
+            options.headers = {**(options.headers or {}), **cond_headers}
 
     def _do_fetch():
         if options.fetcher_mode == FetcherMode.FAST_HTTP:
@@ -178,6 +266,7 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None) -> FetchResult
                 proxy=proxy,
                 headers=options.headers or None,
                 stealthy_headers=True,
+                **persona_kwargs,
             )
         elif options.fetcher_mode == FetcherMode.DYNAMIC_BROWSER:
             return DynamicFetcher.fetch(
@@ -187,6 +276,7 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None) -> FetchResult
                 disable_resources=options.disable_resources,
                 timeout=options.timeout_s * 1000,
                 proxy=proxy,
+                **persona_kwargs,
             )
         elif options.fetcher_mode == FetcherMode.STEALTH_BROWSER:
             return StealthyFetcher.fetch(
@@ -201,6 +291,7 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None) -> FetchResult
                 block_webrtc=_is_tor(options.proxy),
                 timeout=options.timeout_s * 1000,
                 proxy=proxy,
+                **persona_kwargs,
             )
         else:
             raise FetchError(url, f"وضع جلب غير معروف: {options.fetcher_mode}")
@@ -252,6 +343,23 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None) -> FetchResult
     ok = status is None or (200 <= int(status) < 400)
     if not ok:
         raise FetchError(url, f"HTTP {status}")
+
+    # ---- cache store / revalidate ----
+    if use_cache:
+        status_int = int(status) if status is not None else 200
+        if status_int == 304:
+            # revalidated: server says unchanged - serve the cached body
+            hit = cache.cache_get(url, 10**12)   # force the stale-but-present path
+            if hit is not None:
+                return FetchResult(url=url, page=_CachedPage(hit[0], url), status=200, ok=True)
+        elif status_int == 200 and cache is not None:
+            html = get_html(page)
+            if html:
+                headers = getattr(page, "headers", None)
+                cache.cache_put(
+                    url, html,
+                    etag=_header_value(headers, "ETag"),
+                    last_modified=_header_value(headers, "Last-Modified"))
 
     return FetchResult(url=url, page=page, status=status, ok=ok)
 
