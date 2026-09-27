@@ -1,5 +1,5 @@
 """
-Add/Edit Source dialog - "خليني اقدر من جوا اضيف مصادر جديدة".
+Add/Edit Source dialog - (yezawed sources men gowa el app).
 
 Lets the user define a new scraping source (a domain + a "repeat over"
 container selector + the fields to pull from each listing + an optional
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.models import ExtractionField
+from app.ui.widgets.buttons import PrimaryButton
 from app.ui.widgets.field_builder import FieldBuilder
 
 
@@ -82,8 +83,7 @@ class SourceDialog(QDialog):
         buttons.addStretch(1)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        save_btn = QPushButton("Save Source")
-        save_btn.setObjectName("primaryButton")
+        save_btn = PrimaryButton("Save Source")
         save_btn.clicked.connect(self._save)
         buttons.addWidget(cancel_btn)
         buttons.addWidget(save_btn)
@@ -124,7 +124,7 @@ class SourceDialog(QDialog):
         if not name or not domain or not container_selector or not fields:
             QMessageBox.warning(
                 self, "Add Source",
-                "لازم تملأ: الاسم، الدومين، الـ container selector (repeat over)، وحقل واحد على الأقل.",
+                "Fill in: name, domain, the container selector (repeat over), and at least one field.",
             )
             return
 

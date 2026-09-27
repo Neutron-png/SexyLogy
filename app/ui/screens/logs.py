@@ -58,7 +58,7 @@ class LogsScreen(QWidget):
             self.log_panel.append_entry(r["level"], r["message"])
 
     def _clear(self):
-        if QMessageBox.question(self, "Clear logs", "امسح كل السجلات؟") == QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, "Clear logs", "Clear all logs?") == QMessageBox.StandardButton.Yes:
             self.db.clear_logs()
             self.refresh()
 
@@ -70,7 +70,7 @@ class LogsScreen(QWidget):
         with open(path, "w", encoding="utf-8") as f:
             for r in reversed(rows):
                 f.write(f"[{r['level']}] {r['message']}\n")
-        QMessageBox.information(self, "Export", f"تم التصدير إلى:\n{path}")
+        QMessageBox.information(self, "Export", f"Exported to:\n{path}")
 
     def showEvent(self, event):
         self.refresh()

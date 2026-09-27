@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.ui.widgets import icons
+from app.ui.widgets.buttons import PrimaryButton
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget,
     QListWidgetItem, QMessageBox, QComboBox,
@@ -33,7 +35,7 @@ class ApiKeysScreen(QWidget):
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         subtitle = QLabel(
-            "Used by AI Auto-Extract in New Scrape. Encrypted at rest, never written to logs or exports."
+            "Used by AI Auto-Extract in New Campaign. Encrypted at rest, never written to logs or exports."
         )
         subtitle.setObjectName("pageSubtitle")
         layout.addWidget(subtitle)
@@ -56,12 +58,12 @@ class ApiKeysScreen(QWidget):
         self.key_input = QLineEdit()
         self.key_input.setPlaceholderText("Paste your API key here (sk-... / sk-ant-...)")
         self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.show_key_chk = QPushButton("👁")
+        self.show_key_chk = QPushButton()
+        self.show_key_chk.setIcon(icons.icon("eye", "#8FA3C0", 16))
         self.show_key_chk.setCheckable(True)
         self.show_key_chk.setFixedWidth(36)
         self.show_key_chk.toggled.connect(self._toggle_visibility)
-        save_btn = QPushButton("Save Key")
-        save_btn.setObjectName("primaryButton")
+        save_btn = PrimaryButton("Save Key")
         save_btn.clicked.connect(self._save_key)
 
         form_row.addWidget(self.provider_combo)
@@ -111,7 +113,7 @@ class ApiKeysScreen(QWidget):
         provider_id = self.provider_combo.currentData()
         value = self.key_input.text().strip()
         if not value:
-            QMessageBox.warning(self, "API Keys", "الصق المفتاح الأول قبل ما تحفظ.")
+            QMessageBox.warning(self, "AI Setup", "Paste a key first, then save.")
             return
         # The provider dropdown defaults to "Anthropic (Claude)" (added
         # first) - pasting an OpenAI key without noticing/changing it
@@ -126,18 +128,16 @@ class ApiKeysScreen(QWidget):
         if provider_id == "openai" and looks_like_anthropic:
             if QMessageBox.question(
                 self, "API Keys",
-                "المفتاح ده شكله مفتاح Anthropic (بيبدأ بـ sk-ant-)، بس انت مختار 'OpenAI' في القائمة "
-                "فوق. لو تكمل حفظ كده، المفتاح هيتسجل باسم 'openai' وممكن يفشل لما يتستخدم فعليًا.\n\n"
-                "متأكد إنك عايز تكمل؟",
+                "This looks like an Anthropic key (starts with sk-ant-) but you picked 'OpenAI' above. "
+                "Saving it as 'openai' may fail later.\n\nContinue anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             ) != QMessageBox.StandardButton.Yes:
                 return
         elif provider_id == "anthropic" and not looks_like_anthropic and value.startswith("sk-"):
             if QMessageBox.question(
                 self, "API Keys",
-                "المفتاح ده شكله مفتاح OpenAI (بيبدأ بـ sk- بس مش sk-ant-)، بس انت مختار 'Anthropic' في "
-                "القائمة فوق. لو تكمل حفظ كده، المفتاح هيتسجل باسم 'anthropic' وممكن يفشل لما يتستخدم "
-                "فعليًا.\n\nمتأكد إنك عايز تكمل؟",
+                "This looks like an OpenAI key (starts with sk- but not sk-ant-) but you picked 'Anthropic' "
+                "above. Saving it as 'anthropic' may fail later.\n\nContinue anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             ) != QMessageBox.StandardButton.Yes:
                 return
@@ -146,7 +146,7 @@ class ApiKeysScreen(QWidget):
         self.db.set_setting("api_keys", keys)
         self.key_input.clear()
         self.refresh()
-        QMessageBox.information(self, "API Keys", "تم الحفظ. المفتاح مشفّر على القرص.")
+        QMessageBox.information(self, "AI Setup", "Saved. The key is encrypted on disk.")
 
     def _remove_key(self):
         item = self.list_widget.currentItem()
