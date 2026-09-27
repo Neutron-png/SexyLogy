@@ -1,4 +1,4 @@
-from app.core.engine.scrapling_adapter import html_to_text
+from app.core.engine.fetch_engine import html_to_text
 
 SAMPLE = """
 <html><head><title>Acme</title><style>.x{color:red}</style></head>
