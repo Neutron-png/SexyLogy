@@ -3,7 +3,7 @@ Job Manager: owns the background thread that actually runs a scrape, and
 is the only bridge between the Qt UI and the (Qt-free) engine layer.
 
 Architecture (spec section 12):
-    UI -> JobManager -> ScrapeJobWorker -> scrapling_adapter -> Scrapling
+    UI -> JobManager -> ScrapeJobWorker -> fetch_engine -> the fetch engine
                                         -> extractor
                                         -> Database (streamed results)
 
@@ -12,25 +12,29 @@ or a browser call (spec section 13/29: "no UI freezing").
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 import traceback
 from collections import deque
+from dataclasses import asdict
 from typing import Optional
+from urllib import robotparser
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from app.core.engine import scrapling_adapter as engine
+from app.core.engine import fetch_engine as engine
 from app.core.engine import ai_extractor
 from app.core.engine import anonymity
+from app.core.engine import proxy_feed
 from app.core.engine import brain as brain_mod
 from app.core.engine.dedupe import fingerprint_lead
 from app.core.engine.extractor import extract_fields, extract_records, ExtractionError
 from app.core.engine.qualifier import qualify_html
-from app.core.models import ExtractionField, FetcherMode, JobStatus, TargetConfig, ScrapeOptions, LogLevel
+from app.core.models import ExtractionField, FetcherMode, JobStatus, TargetConfig, ScrapeOptions, LogLevel, ProxyConfig, AIExtractionConfig
 from app.core.storage.db import Database
-from app.core.storage.secrets import SecretStore
+from app.core.storage.secrets import SecretStore, redact_secrets
 
 
 class ScrapeJobWorker(QObject):
@@ -45,7 +49,8 @@ class ScrapeJobWorker(QObject):
                  target: TargetConfig, fields: list[ExtractionField],
                  options: ScrapeOptions, container: Optional[dict] = None,
                  detail_config: Optional[dict] = None,
-                 source_profiles: Optional[list[dict]] = None):
+                 source_profiles: Optional[list[dict]] = None,
+                 resumed: bool = False):
         super().__init__()
         self.db = db
         self.job_id = job_id
@@ -101,6 +106,27 @@ class ScrapeJobWorker(QObject):
         self._brain: Optional[brain_mod.Brain] = None
         self._pacer: Optional[brain_mod.BurstPacer] = None
         self._requeues: dict[str, int] = {}   # parked-domain requeue guard
+        # WAF-rescue memory (per job): hosts whose fast-HTTP fetch comes
+        # back as a challenge shell. After one successful stealth rescue
+        # the host's remaining URLs go straight to the stealth browser
+        # (skipping the wasted shell fetch); after a failed rescue the
+        # host is marked dead so we don't burn ~30s per URL on retries.
+        self._force_browser_hosts: set[str] = set()
+        self._browser_dead_hosts: set[str] = set()
+        self._mode_options: dict = {}
+        self._robots_cache: dict = {}
+        self._raw_by_alias: dict[str, str] = {}
+        self._ai_calls = 0
+        self._ai_budget_warned = False
+        self.resumed = resumed
+        # Persistent-session handles, one per engine mode (audit H2): one
+        # browser per stealth run instead of one per page; cookies/state
+        # survive across pages (official Session Support capability).
+        self._sessions: dict = {}
+        # Adaptive-selector tracking (the fetch engine auto_save/adaptive): first
+        # successful page per host saves the container fingerprint; a
+        # zero-record page later retries with adaptive relocation.
+        self._adaptive_saved_hosts: set[str] = set()
 
         self._stop_requested = False
         self._pause_requested = False
@@ -143,8 +169,29 @@ class ScrapeJobWorker(QObject):
             records_ok = 0
             records_failed = 0
             duplicates_skipped = 0  # leads whose fingerprint was already in lead_history (see dedupe.py)
-            pages_total = max(len(queue), self.target.max_pages)
+            # Honest progress denominator: the actual known work (done +
+            # still queued), NOT target.max_pages. The old
+            # `max(len(queue), target.max_pages)` put 100,000 in the
+            # denominator for a 3-URL run, so the UI bar sat at 0% for the
+            # whole job. Discovered links (follow_links) grow it naturally.
+            pages_total = max(len(queue), 1)
             first_page = True  # no delay before the very first fetch
+
+            # Checkpoint the queue (audit C3/H1): fresh starts write the
+            # full known work; resumes keep existing done/failed rows and
+            # only the pending set was passed in as start_urls.
+            if not self.resumed:
+                self.db.queue_replace(self.job_id, list(queue))
+            else:
+                self.db.queue_reset_in_progress(self.job_id)
+
+            def emit_progress():
+                # One progress shape for every emit site: the denominator
+                # is the ACTUAL known work (finished + still queued), so
+                # the UI bar reflects reality instead of sitting at 0%
+                # against a hypothetical max_pages ceiling.
+                total = max(pages_done + len(queue), 1)
+                self.progress.emit(pages_done, total, records_ok, records_failed)
 
             while queue and not self._stop_requested:
                 while self._pause_requested and not self._stop_requested:
@@ -164,6 +211,7 @@ class ScrapeJobWorker(QObject):
                 # part of why its WAF returned HTTP 403 on nearly every
                 # request after the first few dozen; the 91/91-failed run).
                 url, depth = queue.popleft()
+                self.db.queue_mark(self.job_id, url, "in_progress")
 
                 # Pacing: with the brain active, the per-domain LEARNED delay
                 # (AIMD) and/or the human-burst pacer own this sleep instead
@@ -179,17 +227,52 @@ class ScrapeJobWorker(QObject):
                 # red is PARKED - requeue its URLs for after the park window
                 # instead of burning the identity pool against a wall.
                 if self._brain is not None and not self._brain.gate(url):
-                    self._requeues[url] = self._requeues.get(url, 0) + 1
-                    if self._requeues[url] > 3:
-                        self._emit_log(LogLevel.WARNING, f"تجاوز الحد الأقصى للتأجيل - تخطي {url}")
-                        self._requeues[url] = 0
-                        pages_done += 1
+                    # Host-level (not per-URL) deferral cap: the old per-URL
+                    # guard let a pre-expanded pagination queue (page=2..10)
+                    # of a hard-blocked host keep the job "alive" with a
+                    # 30s-sleep + defer log cycle for many minutes while
+                    # producing nothing (the "9 دقايق من غير ليد" run -
+                    # every URL was yelp/yellowpages 403s being parked).
+                    # After 2 deferrals the host's REMAINING queued URLs are
+                    # dropped for this job and the loop moves on / ends.
+                    host = brain_mod.host_of(url)
+                    self._requeues[host] = self._requeues.get(host, 0) + 1
+                    if self._requeues[host] > 2:
+                        dropped_urls = [(u, d) for (u, d) in queue
+                                        if brain_mod.host_of(u) == host]
+                        queue = deque((u, d) for (u, d) in queue
+                                      if brain_mod.host_of(u) != host)
+                        dropped = len(dropped_urls)
+                        self._emit_log(LogLevel.WARNING,
+                                       f"نطاق {host} محجوب (حماية/403) - تخطي {dropped} "
+                                       f"رابط متبقٍ منه في هذه المهمة")
+                        # checkpoint: the dropped URLs are 'skipped', the
+                        # current one too - they exist for a later resume
+                        self.db.queue_mark(self.job_id, url, "skipped")
+                        for u, _d in dropped_urls:
+                            self.db.queue_mark(self.job_id, u, "skipped")
+                        if not queue:
+                            self._emit_log(LogLevel.WARNING,
+                                           "كل الروابط المتبقية من نطاقات محجوبة - "
+                                           "إنهاء المهمة مبكرا. شغّل المهمة لاحقا أو "
+                                           "فعّل بروكسي/Tor لتغيير الهوية")
                         continue
                     queue.append((url, depth))
                     self._emit_log(LogLevel.INFO,
                                    f"النطاق تحت ضغط حماية عالي - تأجيل {url} "
                                    f"ل~{brain_mod.Brain.BREAKER_PARK_S // 60} دقيقة")
                     self._interruptible_sleep(30)
+                    continue
+
+                # Per-source engine override happens after _resolve_source
+                # (below). Robots.txt compliance (audit H5): the flag the
+                # UI shows is now actually enforced - disallowed URLs are
+                # skipped with a visible log line.
+                if self._robots_disallowed(url):
+                    pages_done += 1
+                    self.db.queue_mark(self.job_id, url, "skipped")
+                    self._emit_log(LogLevel.INFO, f"robots.txt يمنع هذا الرابط - تخطي: {url}")
+                    emit_progress()
                     continue
 
                 # Pick this request's identity BEFORE fetching: rotate the
@@ -206,7 +289,29 @@ class ScrapeJobWorker(QObject):
                 self.container, self.fields, self.detail_config = self._resolve_source(url)
                 self._emit_log(LogLevel.INFO, f"جلب الصفحة: {url}")
 
-                fetch_result, error = self._fetch_with_retries(url)
+                host = brain_mod.host_of(url)
+                routed_mode = self._source_fetcher_mode(url)
+                effective_mode = routed_mode or self.options.fetcher_mode
+                # persistent session for this engine (one per mode per job)
+                job_session = self._get_session(effective_mode)
+                if host in self._force_browser_hosts and self.options.fetcher_mode == FetcherMode.FAST_HTTP:
+                    # This host's fast fetch is a WAF shell - go straight
+                    # to the stealth browser (learned earlier this job).
+                    fetch_result, error = self._fetch_with_retries(
+                        url, options=self._browser_options(),
+                        wait_selector=self._container_wait_selector(),
+                        session=self._get_session(FetcherMode.STEALTH_BROWSER))
+                elif routed_mode is not None and routed_mode != self.options.fetcher_mode:
+                    # Per-source engine override: yelp/thumbtack profiles
+                    # declare STEALTH (they need a real browser), so
+                    # yellowpages pages keep the fast lane while these
+                    # still get the browser they need.
+                    fetch_result, error = self._fetch_with_retries(
+                        url, options=self._options_for_mode(routed_mode),
+                        wait_selector=self._container_wait_selector(),
+                        session=job_session)
+                else:
+                    fetch_result, error = self._fetch_with_retries(url, session=job_session)
 
                 if self._stop_requested:
                     break  # Stop was clicked mid-fetch - don't count this as a failed page
@@ -215,19 +320,88 @@ class ScrapeJobWorker(QObject):
 
                 if error is not None:
                     records_failed += 1
+                    self.db.queue_mark(self.job_id, url, "failed")
                     self._emit_log(LogLevel.ERROR, f"فشل جلب {url}: {error}")
                     self.url_error.emit(url, error)
-                    self.progress.emit(pages_done, pages_total, records_ok, records_failed)
+                    emit_progress()
                     continue
 
+                # WAF rescue: a "successful" fetch whose body is a tiny
+                # self-solving challenge shell (AWS WAF - thumbtack.com
+                # returns HTTP 202 + a 2KB empty-title shell to plain HTTP)
+                # silently produces 0 records. Retry once with the stealth
+                # browser, waiting for the source's own container selector;
+                # on success the host goes straight-to-browser for the rest
+                # of the job, on failure it's marked dead to stop wasting
+                # browser runs on it.
+                if self._page_is_shell(fetch_result.page) and host not in self._browser_dead_hosts:
+                    escalated = None
+                    if self.options.fetcher_mode in (FetcherMode.FAST_HTTP, FetcherMode.DYNAMIC_BROWSER):
+                        self._emit_log(LogLevel.INFO,
+                                       "الصفحة رجعت shell فاضي (تحدي حماية) - "
+                                       "إعادة المحاولة بمتصفح stealth...")
+                        escalated, _esc_error = self._fetch_with_retries(
+                            url, options=self._browser_options(),
+                            wait_selector=self._container_wait_selector())
+                    if escalated is not None and not self._page_is_shell(escalated.page):
+                        fetch_result = escalated
+                        self._force_browser_hosts.add(host)
+                    else:
+                        self._browser_dead_hosts.add(host)
+
                 self._emit_log(LogLevel.SUCCESS, f"تم الجلب، جاري الاستخراج: {url}")
+                # Adaptive scraping (official capability): the first page
+                # of each host saves the container fingerprint; a zero later
+                # gets ONE adaptive relocation retry before we call it empty.
+                auto_save = host not in self._adaptive_saved_hosts
                 try:
-                    records = self._extract(fetch_result.page)
+                    records = self._extract(fetch_result.page, auto_save=auto_save)
                 except ExtractionError as e:
                     records_failed += 1
                     self._emit_log(LogLevel.ERROR, f"فشل الاستخراج من {url}: {e}")
                     self.progress.emit(pages_done, pages_total, records_ok, records_failed)
                     continue
+                if not records and auto_save:
+                    try:
+                        records = self._extract(fetch_result.page, adaptive=True)
+                    except Exception:
+                        records = []
+                if records and auto_save:
+                    self._adaptive_saved_hosts.add(host)
+
+                if not records:
+                    # The stealth rescue landed a real page but extracted
+                    # nothing from it (e.g. thumbtack's listing grid is
+                    # client-gated for bot-tier visitors: 0-1 cards, the
+                    # rest of the "10 best" never hydrates). Stop paying
+                    # the ~2min stealth cost per URL for this host.
+                    if host in self._force_browser_hosts and self.options.fetcher_mode == FetcherMode.FAST_HTTP:
+                        self._force_browser_hosts.discard(host)
+                        self._browser_dead_hosts.add(host)
+                    # Honest signal instead of a green SUCCESS-0 line.
+                    if self._page_is_shell(fetch_result.page):
+                        self._emit_log(LogLevel.WARNING,
+                                       f"0 سجل من {url} - الصفحة رجعت shell فاضي "
+                                       f"(تحدي حماية/JS) والموقع محمي ضد الجلب الآلي حاليا")
+                    else:
+                        self._emit_log(LogLevel.WARNING,
+                                       f"0 سجل مطابق للمحددات من {url} - "
+                                       f"راجع الـ Container/الحقول لهذا المصدر")
+                # Source health (audit §4): distinguish an empty market from
+                # a broken selector. A run of consecutive zero-record pages
+                # on one host escalates to a specific ERROR, not another
+                # quiet zero.
+                zeros = self._brain.record_page_outcome(host, bool(records)) if self._brain else (0 if records else 1)
+                if records:
+                    self.db.queue_mark(self.job_id, url, "done")
+                elif zeros >= 10:
+                    self.db.queue_mark(self.job_id, url, "done")
+                    self._emit_log(LogLevel.ERROR,
+                                   f"{host}: {zeros} صفحة متتالية بدون أي سجل - "
+                                   "غالباً الـ selectors بتاعة المصدر ده قديمة والمستخرج مش شغال. "
+                                   "راجع الـ Container/الحقول أو عطّل المصدر")
+                else:
+                    self.db.queue_mark(self.job_id, url, "done")
 
                 for record in records:
                     if self.detail_config:
@@ -257,7 +431,8 @@ class ScrapeJobWorker(QObject):
                     if fingerprint:
                         self.db.record_lead_seen(fingerprint, self.project_id, self.job_id, record)
                     self.result_ready.emit(record)
-                self._emit_log(LogLevel.SUCCESS, f"{len(records)} سجل تم استخراجه من {url}")
+                if records:
+                    self._emit_log(LogLevel.SUCCESS, f"{len(records)} سجل تم استخراجه من {url}")
 
                 if self.target.follow_links and depth < self.target.max_depth:
                     try:
@@ -273,7 +448,7 @@ class ScrapeJobWorker(QObject):
                         self._emit_log(LogLevel.INFO, f"وجدت {len(links)} رابط جديد، أُضيفت لقائمة الانتظار")
 
                 self.db.update_job_progress(self.job_id, pages_done, records_ok, records_failed)
-                self.progress.emit(pages_done, pages_total, records_ok, records_failed)
+                emit_progress()
 
             final_status = JobStatus.STOPPED if self._stop_requested else JobStatus.COMPLETED
             self.db.finish_job(self.job_id, final_status.value)
@@ -297,6 +472,12 @@ class ScrapeJobWorker(QObject):
             except Exception:
                 pass
         finally:
+            # Persistent sessions (one browser per engine mode) must close
+            # before the thread dies, or the browser processes leak.
+            try:
+                self._close_sessions()
+            except Exception:
+                pass
             # Always reached, no matter what failed above - this is what
             # lets thread.quit() run (worker.finished -> thread.quit is
             # connected in JobManager.start_job) so the QThread actually
@@ -315,13 +496,15 @@ class ScrapeJobWorker(QObject):
                     and proxy.proxies[0].startswith("socks5://127.0.0.1:"))
 
     def _current_identity_key(self) -> str:
-        """The Brain's key for whatever identity _prepare_proxy() just picked.
-        Tor identities are tracked per-endpoint (their reputation is really
-        the exit-node pool's), proxies are tracked by their own string."""
+        """Pseudonymous brain key for whatever identity _prepare_proxy()
+        just picked (audit C2): raw proxy URLs carry credentials, so the
+        brain only ever sees the stable alias - 'px:<hash12>', 'direct'
+        or 'tor@<port>' - and the raw string never touches logy.db."""
         proxy = self.options.proxy
         if self._tor_picked():
             return f"tor@{proxy.tor_socks_port}"
-        return proxy.proxies[0] if proxy.proxies else "direct"
+        raw = proxy.proxies[0] if proxy.proxies else "direct"
+        return self._alias_of(raw)
 
     def _build_hybrid_pool(self) -> list[str]:
         """One rotation pool out of the user's proxies + the Tor endpoint.
@@ -336,7 +519,7 @@ class ScrapeJobWorker(QObject):
         return pool
 
     def _identity_pool(self) -> list[str]:
-        """The active identity pool for the current proxy mode."""
+        """The active identity pool for the current proxy mode (raw strings)."""
         proxy = self.options.proxy
         if proxy.mode in ("list", "rotating"):
             return [p for p in self._proxy_pool if p.strip()]
@@ -345,6 +528,30 @@ class ScrapeJobWorker(QObject):
         if proxy.mode == "tor":
             return [f"tor@{proxy.tor_socks_port}"]
         return []
+
+    def _alias_of(self, raw_key: str) -> str:
+        """Pseudonymous identity key for persistence (audit C2): raw proxy
+        URLs contain credentials and must never reach identity_stats.
+        'direct' and local Tor endpoint keys carry no secrets and stay
+        readable; everything else becomes a stable short hash."""
+        if raw_key == "direct" or raw_key.startswith("tor@"):
+            return raw_key
+        if raw_key.startswith("socks5://127.0.0.1:"):
+            return raw_key  # hybrid pool's local Tor endpoint - no secret
+        alias = "px:" + hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:12]
+        self._raw_by_alias.setdefault(alias, raw_key)
+        return alias
+
+    def _raw_of(self, alias: str) -> str:
+        """Reverse map back to the raw proxy string for the adapter."""
+        return self._raw_by_alias.get(alias, alias)
+
+    def _alias_pool(self, pool: list[str]) -> list[str]:
+        out = []
+        for raw in pool:
+            alias = self._alias_of(raw)
+            out.append(alias)
+        return out
 
     def _setup_brain(self):
         """Create the Brain lazily: only when at least one intelligence
@@ -373,8 +580,25 @@ class ScrapeJobWorker(QObject):
     def _probe_proxies_at_start(self):
         """Pre-flight: one cheap parallel request per proxy BEFORE the job,
         so dead entries leave the pool at t=0 instead of surfacing mid-run
-        as mystery failures that pollute the identity statistics."""
+        as mystery failures that pollute the identity statistics.
+
+        Free-feed refresh (proxifly via curl) runs here too, so "rotating"
+        and "hybrid" campaigns start from a FRESH list every run - the
+        community list churns hourly, so an old snapshot rots fast."""
         proxy = self.options.proxy
+        # Re-download the community list on every campaign that uses
+        # proxies (the user's requirement: "يجدد البروكسيز كل مرة").
+        if proxy.mode in ("list", "rotating", "hybrid"):
+            ok, count, msg = proxy_feed.refresh_free_proxies(force=True)
+            self._emit_log(LogLevel.INFO if ok else LogLevel.WARNING, f"تحديث القائمة المجانية: {msg}")
+            if ok and not self._proxy_pool:
+                fresh = proxy_feed.load_list()
+                if fresh:
+                    self._proxy_pool = fresh
+                    self._rotator = None
+                    self._emit_log(LogLevel.INFO,
+                                   f"تم تحميل {len(fresh)} بروكسي من القائمة المجانية (proxifly) - بتتدور تلقائياً")
+
         candidates = [p for p in self._proxy_pool if p.strip()] if proxy.mode in ("list", "rotating", "hybrid") else []
         if not candidates:
             return
@@ -429,18 +653,53 @@ class ScrapeJobWorker(QObject):
         False → caller falls back to the flat options.delay_ms sleep.
         Effective wait = the per-domain AIMD delay, optionally wrapped in
         the burst pacer's self-exciting gap (with AIMD as the floor, so a
-        domain that just pushed back stays slowed regardless of bursts)."""
+        domain that just pushed back stays slowed regardless of bursts).
+        The pacer's own distribution is capped relative to the user's
+        delay_ms: its quiet-regime mean is ~20s by design, which silently
+        turned a 2000ms user delay into a ~30s-per-request crawl (found
+        by timing instrumented runs - pacing dwarfed actual fetching)."""
         if self._brain is None:
             return False
         host = brain_mod.host_of(url)
         aimd_s = self._brain.delay_s(host)
         if self._pacer is not None:
-            self._interruptible_sleep(self._pacer.sample(floor_s=aimd_s))
+            gap = self._pacer.sample(floor_s=aimd_s)
+            user_s = self.options.delay_ms / 1000.0
+            cap = max(user_s * 3.0, aimd_s) + 1.0
+            self._interruptible_sleep(min(gap, cap))
         elif aimd_s > 0:
             self._interruptible_sleep(aimd_s)
         else:
             return False
         return True
+
+    def _source_fetcher_mode(self, url: str):
+        """The engine this URL's source profile declares (STEALTH for
+        yelp/thumbtack, which need a real browser; None = inherit the
+        job's fetcher_mode, i.e. FAST_HTTP for yellowpages). This keeps
+        the WAF-heavy sources on the browser WITHOUT paying the ~5-27s
+        stealth cost on every yellowpages page that doesn't need it."""
+        if not self.source_profiles:
+            return None
+        host = urlparse(url).netloc.lower()
+        for profile in self.source_profiles:
+            if profile.get("domain") and profile["domain"] in host:
+                return profile.get("fetcher_mode")
+        return None
+
+    def _options_for_mode(self, mode: FetcherMode) -> ScrapeOptions:
+        """Options copy for a per-source engine override (cached per mode).
+        Browser modes never touch the FAST_HTTP response cache."""
+        cached = self._mode_options.get(mode)
+        if cached is None:
+            from dataclasses import replace as _dc_replace
+            cached = _dc_replace(
+                self.options,
+                fetcher_mode=mode,
+                use_response_cache=(mode == FetcherMode.FAST_HTTP),
+            )
+            self._mode_options[mode] = cached
+        return cached
 
     def _record_outcome(self, url: str, blocked: bool, latency_s: float = 0.0, error: str = ""):
         """Feed the fetch result back into the Brain: Beta posterior update,
@@ -535,7 +794,11 @@ class ScrapeJobWorker(QObject):
         proxy = self.options.proxy
         if proxy.mode in ("list", "rotating") and len(self._proxy_pool) > 1:
             if self._brain is not None and self.options.use_identity_memory:
-                proxy.proxies = [self._brain.pick(self._identity_pool(), brain_mod.host_of(url), self.options.identity_selection)]
+                # Brain sees only the pseudonymous aliases (C2); the chosen
+                # alias maps back to the raw proxy for the adapter.
+                pool = self._alias_pool(self._identity_pool())
+                picked = self._brain.pick(pool, brain_mod.host_of(url), self.options.identity_selection)
+                proxy.proxies = [self._raw_of(picked)]
             else:
                 if self._rotator is None:
                     self._rotator = anonymity.CyclicProxyRotator(self._proxy_pool)
@@ -547,7 +810,9 @@ class ScrapeJobWorker(QObject):
                 pool = self._build_hybrid_pool()
                 if len(pool) > 1:
                     if self._brain is not None and self.options.use_identity_memory:
-                        proxy.proxies = [self._brain.pick(pool, brain_mod.host_of(url), self.options.identity_selection)]
+                        aliases = self._alias_pool(pool)
+                        picked = self._brain.pick(aliases, brain_mod.host_of(url), self.options.identity_selection)
+                        proxy.proxies = [self._raw_of(picked)]
                     else:
                         if self._rotator is None or len(self._rotator) != len(pool):
                             self._rotator = anonymity.CyclicProxyRotator(pool)
@@ -599,9 +864,103 @@ class ScrapeJobWorker(QObject):
                                "وضع Hybrid محتاج بروكسي واحد على الأقل في القايمة غير التور - "
                                "حالياً كل الريكويستات هتعدّي على Tor بس")
 
-    def _fetch_with_retries(self, url: str):
+    def _page_is_shell(self, page) -> bool:
+        """True when a fetched page is almost certainly a bot-challenge
+        shell rather than real content: an empty <title> (the AWS WAF
+        challenge shell has <title></title>) or a body so small no real
+        listing page would fit it. Real yellowpages/yelp search pages are
+        100KB+; the thumbtack challenge shell is ~2KB with no title."""
+        try:
+            html = engine.get_html(page) or ""
+        except Exception:
+            return False
+        if not html:
+            return True
+        return "<title></title>" in html or len(html) < 2500
+
+    def _robots_disallowed(self, url: str) -> bool:
+        """robots.txt compliance (audit H5 - the flag existed in the UI and
+        TargetConfig but was never enforced). One fetch per host per job,
+        cached; unreachable/unparseable robots.txt fails OPEN (a dead
+        robots endpoint must not silently disable a whole source)."""
+        if not self.target.respect_robots_txt:
+            return False
+        host = brain_mod.host_of(url)
+        if host not in self._robots_cache:
+            parser = None
+            try:
+                parts = urlparse(url)
+                origin = f"{parts.scheme}://{parts.netloc}"
+                robots_opts = ScrapeOptions(fetcher_mode=FetcherMode.FAST_HTTP,
+                                            timeout_s=8, retries=0)
+                fr = engine.fetch_one(origin + "/robots.txt", robots_opts,
+                                      should_stop=lambda: self._stop_requested)
+                rp = robotparser.RobotFileParser()
+                rp.parse((engine.get_html(fr.page) or "").splitlines())
+                parser = rp
+            except Exception as e:
+                self._emit_log(LogLevel.DEBUG, f"تعذر قراءة robots.txt لـ {host} - متابعة (fail-open): {e}")
+            self._robots_cache[host] = parser
+        parser = self._robots_cache[host]
+        if parser is None:
+            return False
+        try:
+            return not parser.can_fetch("*", url)
+        except Exception:
+            return False
+
+    def _container_wait_selector(self) -> Optional[str]:
+        """The resolved source's container selector, used as the browser's
+        wait target so the snapshot lands AFTER challenge-solve + hydration."""
+        return (self.container or {}).get("selector") or None
+
+    def _get_session(self, mode: FetcherMode):
+        """Open (once per mode per job) the persistent session handle for
+        this engine. Failures fall back to per-page fetches with one debug
+        line - a session problem must never kill a run."""
+        if not self.options.use_sessions:
+            return None
+        if mode not in self._sessions:
+            try:
+                handle = engine.open_session(self.options, mode)
+                if handle is not None:
+                    handle.enter()
+                self._sessions[mode] = handle
+            except Exception as e:
+                self._emit_log(LogLevel.DEBUG,
+                               f"تعذر فتح جلسة {mode.value} - الجلب هيتم لكل صفحة على حدة: {e}")
+                self._sessions[mode] = None
+        return self._sessions[mode]
+
+    def _close_sessions(self):
+        for mode, handle in list(self._sessions.items()):
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            self._sessions[mode] = None
+
+    def _browser_options(self):
+        """Options copy for the WAF-rescue / straight-to-browser fetch:
+        stealth engine, no response cache. The generous timeout covers the
+        full challenge-solve → reload → redirect → render sequence (AWS WAF
+        ~10s + thumbtack's category redirect ate a 90s budget once)."""
+        from dataclasses import replace as _dc_replace
+        return _dc_replace(
+            self.options,
+            fetcher_mode=FetcherMode.STEALTH_BROWSER,
+            use_response_cache=False,
+            retries=0,
+            timeout_s=max(self.options.timeout_s, 150),
+        )
+
+    def _fetch_with_retries(self, url: str, options: Optional[ScrapeOptions] = None,
+                            wait_selector: Optional[str] = None,
+                            session=None) -> tuple:
+        options = options or self.options
         last_error = None
-        attempts = max(1, self.options.retries + 1)
+        attempts = max(1, options.retries + 1)
         for attempt in range(1, attempts + 1):
             if self._stop_requested:
                 return None, "أوقفه المستخدم"
@@ -611,9 +970,11 @@ class ScrapeJobWorker(QObject):
                 # ~0.25s of a Stop click, instead of only being checked
                 # between whole retry attempts (which could be up to
                 # timeout+15s apart) - that gap was why Stop looked broken.
-                result = engine.fetch_one(url, self.options,
+                result = engine.fetch_one(url, options,
                                           should_stop=lambda: self._stop_requested,
-                                          cache=self._brain)
+                                          cache=self._brain,
+                                          wait_selector=wait_selector,
+                                          session=session)
                 if self._brain is not None:
                     # Learning step: success feeds the Beta posterior, AIMD
                     # speed-up and WAF-state decay for this domain+identity.
@@ -641,7 +1002,7 @@ class ScrapeJobWorker(QObject):
                     # final failed attempt still counts as a block signal
                     self._record_outcome(url, blocked=True,
                                          latency_s=time.time() - started, error=last_error)
-            except RuntimeError as e:  # Scrapling not installed
+            except RuntimeError as e:  # the fetch engine not installed
                 return None, str(e)
         return None, last_error
 
@@ -651,6 +1012,33 @@ class ScrapeJobWorker(QObject):
         end = time.time() + seconds
         while time.time() < end and not self._stop_requested:
             time.sleep(min(0.2, max(0.0, end - time.time())))
+
+    def _ai_budget_available(self) -> bool:
+        """Hard per-run ceiling on paid AI calls (audit H6): owner-lookup
+        and auto-extract share one budget so a 2,000-lead run can't turn
+        into a surprise bill."""
+        budget = self.options.ai_extraction.ai_call_budget
+        if not budget:
+            return True
+        if self._ai_calls >= budget:
+            if not self._ai_budget_warned:
+                self._ai_budget_warned = True
+                self._emit_log(LogLevel.WARNING,
+                               f"تم الوصول لحد ميزانية الذكاء الاصطناعي ({budget} نداء) - "
+                               "باقي التشغيل هيتكم بدون نداءات AI مدفوعة")
+            return False
+        return True
+
+    def _mark_ai_fields(self, record: dict, keys: list[str]) -> None:
+        """Provenance marker (audit H6): AI-inferred values are stored
+        alongside the record as an explicit list, so an exported lead can
+        always be separated into SELECTOR-EXTRACTED FACT vs AI INFERENCE.
+        The fields themselves stay in place for usability - the marker is
+        what keeps the distinction honest."""
+        if keys:
+            merged = set(record.get("_ai_extracted_fields") or [])
+            merged.update(keys)
+            record["_ai_extracted_fields"] = sorted(merged)
 
     def _qualify_lead(self, record: dict, source_url: str) -> None:
         """Automatic 'weak digital marketing' check (spec: ICP criterion
@@ -673,6 +1061,11 @@ class ScrapeJobWorker(QObject):
             return
 
         website_url = urljoin(source_url, website)
+        # The breaker guards enrichment fetches too (audit §6): a parked
+        # host must not be hammered once per lead by the quality checks.
+        if self._brain is not None and not self._brain.gate(website_url):
+            self._emit_log(LogLevel.DEBUG, f"النطاق تحت ضغط - تخطي فحص الجودة: {website_url}")
+            return
         quick_check_options = _Opts(fetcher_mode=_FM.FAST_HTTP, timeout_s=10, retries=0)
         try:
             # Direct call, not through _fetch_with_retries - a dead lead
@@ -720,18 +1113,25 @@ class ScrapeJobWorker(QObject):
 
         website_url = urljoin(source_url, website)
         owner_fields = ["owner_name", "owner_email", "owner_phone", "owner_linkedin_if_published"]
+        if not self._ai_budget_available():
+            return
         try:
             fr = engine.fetch_one(website_url, self.options, should_stop=lambda: self._stop_requested)
             html = engine.get_html(fr.page)
             text = engine.html_to_text(html)
             owner_data = ai_extractor.extract(provider, text, owner_fields, api_key)
+            self._ai_calls += 1
         except Exception as e:
             self._emit_log(LogLevel.DEBUG, f"تعذر البحث عن بيانات مالك من {website_url}: {e}")
             return
 
+        filled = []
         for key, value in owner_data.items():
             if value not in (None, ""):
                 record[key] = value
+                filled.append(key)
+        if filled:
+            self._mark_ai_fields(record, filled)
 
     def _enrich_with_detail_page(self, record: dict, source_url: str) -> None:
         """Fill in fields that only exist on a per-business detail page,
@@ -761,6 +1161,10 @@ class ScrapeJobWorker(QObject):
             return
 
         detail_url = urljoin(source_url, link)
+        # Breaker guard (audit §6): don't hammer a parked host per-lead.
+        if self._brain is not None and not self._brain.gate(detail_url):
+            self._emit_log(LogLevel.DEBUG, f"النطاق تحت ضغط - تخطي صفحة التفاصيل: {detail_url}")
+            return
         try:
             fr = engine.fetch_one(detail_url, self.options, should_stop=lambda: self._stop_requested)
         except Exception as e:
@@ -809,11 +1213,12 @@ class ScrapeJobWorker(QObject):
         self._emit_log(LogLevel.WARNING, f"لا يوجد إعداد استخراج معروف لمصدر هذا الرابط: {url} - هيتستخدم الإعداد الافتراضي")
         return self._base_container, self._base_fields, self._base_detail_config
 
-    def _extract(self, page) -> list[dict]:
+    def _extract(self, page, *, adaptive: bool = False, auto_save: bool = False) -> list[dict]:
         if self.options.ai_extraction.enabled:
             return self._extract_with_ai(page)
         if self.container and self.container.get("selector"):
-            return extract_records(page, self.container["selector"], self.container.get("type", "css"), self.fields)
+            return extract_records(page, self.container["selector"], self.container.get("type", "css"),
+                                   self.fields, adaptive=adaptive, auto_save=auto_save)
         return [extract_fields(page, self.fields)]
 
     def _extract_with_ai(self, page) -> list[dict]:
@@ -824,12 +1229,16 @@ class ScrapeJobWorker(QObject):
         listing pages with many cards - use Custom Selector for those)."""
         ai_cfg = self.options.ai_extraction
         api_key = self._resolve_api_key(ai_cfg.provider)
+        if not self._ai_budget_available():
+            raise ExtractionError("ai_budget", "تم استهلاك ميزانية نداءات الذكاء الاصطناعي لهذه المهمة")
         html = engine.get_html(page)
         text = engine.html_to_text(html)
         try:
             record = ai_extractor.extract(ai_cfg.provider, text, ai_cfg.field_names, api_key)
+            self._ai_calls += 1
         except ai_extractor.AIExtractionError as e:
             raise ExtractionError("ai_extract", str(e)) from e
+        self._mark_ai_fields(record, [f for f in ai_cfg.field_names if record.get(f) not in (None, "")])
         return [record]
 
     def _resolve_api_key(self, provider: str) -> str:
@@ -851,8 +1260,12 @@ class ScrapeJobWorker(QObject):
         return True
 
     def _emit_log(self, level: LogLevel, message: str):
-        self.db.add_log(self.job_id, level.value, message)
-        self.log.emit(level.value, message)
+        # Central redaction sink (audit C2): every job log line passes
+        # through here, so scheme://user:pass@host can never reach
+        # logy.db or the UI feed even if a caller forgets.
+        safe = redact_secrets(message)
+        self.db.add_log(self.job_id, level.value, safe)
+        self.log.emit(level.value, safe)
 
 
 class JobManager(QObject):
@@ -896,7 +1309,11 @@ class JobManager(QObject):
         if self.is_running:
             raise RuntimeError("مهمة تانية شغالة بالفعل. أوقفها الأول.")
 
-        job_id = self.db.create_job(project_id, pages_total=max(len(target.start_urls), target.max_pages))
+        job_id = self.db.create_job(project_id, pages_total=max(len(target.start_urls), 1))
+        # Persist the full job specification (audit C3/H1): an interrupted
+        # job can be reconstructed from this + its job_queue checkpoint.
+        self.db.set_job_spec(job_id, self._serialize_spec(
+            target, fields, options, container, detail_config, source_profiles))
         worker = ScrapeJobWorker(self.db, job_id, project_id, target, fields, options, container, detail_config, source_profiles)
         thread = QThread()
         worker.moveToThread(thread)
@@ -907,6 +1324,88 @@ class JobManager(QObject):
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_thread_finished)
 
+        self._thread = thread
+        self._worker = worker
+        return job_id, worker
+
+    @staticmethod
+    def _serialize_spec(target: TargetConfig, fields: list[ExtractionField], options: ScrapeOptions,
+                        container: Optional[dict], detail_config: Optional[dict],
+                        source_profiles: Optional[list[dict]]) -> dict:
+        spec = {
+            "target": asdict(target),
+            "options": {**asdict(options), "fetcher_mode": options.fetcher_mode.value},
+            "fields": [f.to_dict() for f in fields],
+            "container": container,
+            "detail_config": detail_config,
+            "source_profiles": None,
+        }
+        if source_profiles:
+            out_profiles = []
+            for p in source_profiles:
+                q = dict(p)
+                fm = q.get("fetcher_mode")
+                if isinstance(fm, FetcherMode):
+                    q["fetcher_mode"] = fm.value
+                if q.get("fields") is not None:
+                    q["fields"] = [f.to_dict() if isinstance(f, ExtractionField) else f
+                                   for f in q["fields"]]
+                out_profiles.append(q)
+            spec["source_profiles"] = out_profiles
+        return spec
+
+    def prepare_resume_job(self, job_id: int) -> tuple[int, ScrapeJobWorker]:
+        """Rebuild a worker for an INTERRUPTED job from its persisted spec
+        + queue checkpoint (audit C3/H1): the remaining 'pending' URLs are
+        the exact remaining work, 'done' rows are never re-fetched, and
+        lead dedupe guards the record side. Returns (job_id, worker) the
+        same way prepare_job() does - connect UI signals, then call
+        start_prepared_job()."""
+        if self.is_running:
+            raise RuntimeError("مهمة تانية شغالة بالفعل. أوقفها الأول.")
+        spec = self.db.get_job_spec(job_id)
+        if not spec:
+            raise RuntimeError("المهمة دي محفوظة من نسخة أقدم - مفيش مواصفات محفوظة للاستئناف.")
+        # rows that were mid-flight when the app died go back to pending -
+        # their fetch never completed, so they are exactly the resume work
+        self.db.queue_reset_in_progress(job_id)
+        pending = self.db.queue_pending(job_id)
+        if not pending:
+            raise RuntimeError("مفيش روابط متبقية للاستئناف في المهمة دي.")
+
+        target = TargetConfig(**spec["target"])
+        target.start_urls = [u for u, _ in pending]
+        od = dict(spec["options"])
+        od["fetcher_mode"] = FetcherMode(od.get("fetcher_mode", "fast_http"))
+        od["proxy"] = ProxyConfig(**od.get("proxy", {}))
+        od["ai_extraction"] = AIExtractionConfig(**od.get("ai_extraction", {}))
+        options = ScrapeOptions(**od)
+        fields = [ExtractionField.from_dict(f) for f in spec.get("fields") or []]
+        container = spec.get("container")
+        detail_config = spec.get("detail_config")
+        profiles = spec.get("source_profiles")
+        if profiles:
+            for p in profiles:
+                fm = p.get("fetcher_mode")
+                if fm:
+                    p["fetcher_mode"] = FetcherMode(fm)
+                if p.get("fields") is not None:
+                    p["fields"] = [ExtractionField.from_dict(f) if isinstance(f, dict) else f
+                                   for f in p["fields"]]
+
+        worker = ScrapeJobWorker(self.db, job_id, None, target, fields, options,
+                                 container, detail_config, profiles, resumed=True)
+        self.db.mark_job_resumed(job_id)
+        self.db.add_log(job_id, LogLevel.INFO.value,
+                        f"استئناف المهمة من نقطة التوقف: {len(pending)} رابط متبقٍ")
+
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_thread_finished)
         self._thread = thread
         self._worker = worker
         return job_id, worker
