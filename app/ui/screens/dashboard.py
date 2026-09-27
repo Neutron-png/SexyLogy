@@ -54,20 +54,20 @@ class DashboardScreen(QWidget):
         failed = sum(1 for j in jobs if j["status"] in ("failed", "stopped"))
 
         for card in (
-            stat_card("Total Scrapes", str(total)),
-            stat_card("Total Records", str(total_records)),
-            stat_card("Successful Runs", str(successful)),
-            stat_card("Failed Runs", str(failed)),
+            stat_card("Campaigns run", str(total)),
+            stat_card("Leads collected", str(total_records)),
+            stat_card("Completed", str(successful)),
+            stat_card("Stopped / blocked", str(failed)),
         ):
             self.cards_row.addWidget(card)
 
         self.recent_list.clear()
         if not jobs:
-            self.recent_list.addItem("No scraping jobs yet. Start one from New Scrape.")
+            self.recent_list.addItem("No campaigns yet. Start one from New Campaign.")
             return
         for j in jobs[:20]:
             item = QListWidgetItem(
-                f"Job #{j['id']}  ·  {j['status'].upper()}  ·  {j['records_ok']} records  ·  {j['pages_done']} pages"
+                f"Campaign #{j['id']}  ·  {j['status'].upper()}  ·  {j['records_ok']} leads  ·  {j['pages_done']} pages"
             )
             self.recent_list.addItem(item)
 

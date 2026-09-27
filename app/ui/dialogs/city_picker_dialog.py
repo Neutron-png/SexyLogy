@@ -1,6 +1,5 @@
 """
-City picker dialog - "خليني احدد المدن ... تبقى في سلايدر فيه كل المدن
-اللي بنشتغل عليها + سيرش بار فيها".
+City picker dialog - (el medon teb2a fe slider feha search bar).
 
 Replaces free-text city entry with a scrollable, checkable list of every
 city in CITY_POOL plus a live search box to filter it, so restricting a
@@ -18,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.engine.builtin_templates import CITY_POOL
+from app.ui.widgets.buttons import PrimaryButton
 
 
 class CityPickerDialog(QDialog):
@@ -73,8 +73,7 @@ class CityPickerDialog(QDialog):
         buttons.addStretch(1)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        ok_btn = QPushButton("OK")
-        ok_btn.setObjectName("primaryButton")
+        ok_btn = PrimaryButton("OK")
         ok_btn.clicked.connect(self.accept)
         buttons.addWidget(cancel_btn)
         buttons.addWidget(ok_btn)

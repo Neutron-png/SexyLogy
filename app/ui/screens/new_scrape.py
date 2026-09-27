@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal, QSize, QRectF
+from PySide6.QtGui import QFont, QColor, QPainter
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
     QLineEdit, QTabWidget, QComboBox, QSpinBox, QCheckBox, QFormLayout,
     QScrollArea, QMessageBox, QFileDialog, QProgressBar, QSplitter, QToolBox,
     QTableView, QAbstractItemView, QListWidget, QListWidgetItem,
+    QStyledItemDelegate, QStyle, QFrame,
 )
 
 from app.core.models import (
@@ -15,7 +17,7 @@ from app.core.models import (
 )
 from app.core.engine.nl_to_fields import generate_fields
 from app.core.engine.ai_extractor import DEFAULT_FIELD_NAMES as DEFAULT_AI_FIELDS
-from app.core.engine import scrapling_adapter as engine
+from app.core.engine import fetch_engine as engine
 from app.core.engine.builtin_templates import (
     generate_niche_urls_per_city,
     YELP_CONTAINER, YELP_DETAIL_CONFIG,
@@ -28,16 +30,20 @@ from app.core.storage.db import Database
 from app.utils.validation import parse_url_list, validate_json_schema
 from app.ui.dialogs.source_dialog import SourceDialog
 from app.ui.dialogs.city_picker_dialog import CityPickerDialog
+from app.ui.widgets.accordion import Accordion
+from app.ui.widgets.buttons import PrimaryButton
+from app.ui.widgets import icons
 from app.ui.widgets.field_builder import FieldBuilder
-from app.ui.widgets.log_panel import LogPanel
-from app.ui.widgets.results_table import ResultsTableModel
+from app.ui.widgets.log_panel import ActivityFeed
+from app.ui.widgets.results_table import ResultsTableModel, QualityPillDelegate
+from app.ui.widgets.switch import Switch, ThemeToggle
 
 
 def card(title: str) -> tuple[QWidget, QVBoxLayout]:
+    """Plain content container (no chrome) — the hero/accordion provide styling."""
     w = QWidget()
-    w.setObjectName("card")
     layout = QVBoxLayout(w)
-    layout.setContentsMargins(16, 14, 16, 16)
+    layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(10)
     if title:
         label = QLabel(title)
@@ -46,7 +52,77 @@ def card(title: str) -> tuple[QWidget, QVBoxLayout]:
     return w, layout
 
 
+class SourceListDelegate(QStyledItemDelegate):
+    """Concept-17 sources row: colored initial badge + name + right-aligned
+    'Built-in · Ready' tag, instead of one flat text line."""
+
+    BADGE_BG = {
+        "y": "#2E6BFF", "r": "#FF4B4B", "b": "#0AA8A0", "m": None,
+    }
+
+    def paint(self, p: QPainter, opt: QStyleOptionViewItem, index):
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        from app.ui import theme as ui_theme
+        dark = ui_theme.current() == "dark"
+        tk = ui_theme.tokens()
+
+        sel = opt.state & QStyle.StateFlag.State_Selected
+        hover = opt.state & QStyle.StateFlag.State_MouseOver
+        r = opt.rect
+        if sel:
+            p.fillRect(r, QColor(0, 0, 0, 0))  # selection tint painted by accent-soft below
+            c = QColor(tk["PRIMARY"]); c.setAlphaF(0.16 if dark else 0.10)
+            p.fillRect(r, c)
+        elif hover:
+            c = QColor(255, 255, 255); c.setAlphaF(0.05 if dark else 0.45)
+            p.fillRect(r, c)
+
+        name = index.data(Qt.ItemDataRole.UserRole + 1) or ""
+        domain = index.data(Qt.ItemDataRole.UserRole + 2) or ""
+        letter = index.data(Qt.ItemDataRole.UserRole + 3) or "?"
+        badge_kind = index.data(Qt.ItemDataRole.UserRole + 4) or "m"
+        tag = index.data(Qt.ItemDataRole.UserRole + 5) or ""
+
+        # badge chip
+        bs = 22
+        bx, by = r.x() + 11, r.y() + (r.height() - bs) // 2
+        bg_hex = self.BADGE_BG.get(badge_kind)
+        if bg_hex:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(bg_hex))
+        else:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 41 if dark else 46))
+        p.drawEllipse(QRectF(bx, by, bs, bs))
+        p.setPen(QColor("#FFFFFF") if bg_hex else QColor("#8FA3C0" if dark else "#5A6073"))
+        f = p.font(); f.setPointSizeF(8.5); f.setBold(True); p.setFont(f)
+        p.drawText(QRectF(bx, by, bs, bs), Qt.AlignmentFlag.AlignCenter, letter)
+
+        # name + domain
+        f = p.font(); f.setBold(False); f.setPointSizeF(9.5); p.setFont(f)
+        p.setPen(QColor(tk["TEXT"]))
+        p.drawText(QRectF(bx + bs + 9, r.y(), 240, r.height()), Qt.AlignmentFlag.AlignVCenter, name)
+        fw = p.fontMetrics().horizontalAdvance(name)
+        p.setPen(QColor(tk["MUTED"]))
+        p.drawText(QRectF(bx + bs + 9 + fw + 8, r.y(), r.width(), r.height()),
+                   Qt.AlignmentFlag.AlignVCenter, f"({domain})")
+
+        # right tag
+        if tag:
+            p.setPen(QColor(tk["MUTED"]))
+            f = p.font(); f.setPointSizeF(8.5); p.setFont(f)
+            p.drawText(r.adjusted(0, 0, -12, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tag)
+        p.restore()
+
+    def sizeHint(self, opt, index):
+        return QSize(opt.rect.width() if opt.rect.width() else 300, 30)
+
+
 class NewScrapeScreen(QWidget):
+    theme_changed = Signal(bool)
+    open_logs = Signal()
+
     def __init__(self, db: Database, job_manager: JobManager, parent=None):
         super().__init__(parent)
         self.db = db
@@ -68,8 +144,8 @@ class NewScrapeScreen(QWidget):
         # selector set for every URL in the job - see
         # ScrapeJobWorker._resolve_source().
         self._active_source_profiles: list[dict] | None = None
-        # Cities to restrict every generated search URL to - "خليني اقدر
-        # احدد المدن اللي محتاجها". Defaults to the full CITY_POOL (every
+        # restrict kol search links tani generated l medon el user ekhtarha (default: kol 100)
+        # Defaults to the full CITY_POOL (every
         # box checked in the picker) - the previous, only, behavior.
         # Changed via _open_city_picker() below; read by _collect_cities().
         self._selected_cities: list[tuple[str, str]] = list(CITY_POOL)
@@ -78,28 +154,31 @@ class NewScrapeScreen(QWidget):
         root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(14)
 
-        # ---- header ----
+        # ---- header: title + theme switch (prototype topbar) ----
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("New Scrape")
+        title = QLabel("New Campaign")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Configure your scraping task")
+        subtitle = QLabel("Set it up in under a minute — LOGY handles the technical part.")
         subtitle.setObjectName("pageSubtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box)
         header.addStretch(1)
 
-        self.save_btn = QPushButton("Save Project")
-        self.start_btn = QPushButton("▶ Start Scraping")
-        self.start_btn.setObjectName("primaryButton")
-        self.pause_btn = QPushButton("⏸ Pause")
-        self.stop_btn = QPushButton("■ Stop")
+        self.save_btn = QPushButton("Save Draft")
+        self.start_btn = PrimaryButton("Start Campaign")
+        self.pause_btn = QPushButton("Pause")
+        self.stop_btn = QPushButton("Stop")
         self.stop_btn.setObjectName("dangerButton")
         self.pause_btn.setVisible(False)
         self.stop_btn.setVisible(False)
         for b in (self.save_btn, self.start_btn, self.pause_btn, self.stop_btn):
-            header.addWidget(b)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_button_icons()
+        self.theme_toggle = ThemeToggle()
+        self.theme_toggle.transitionStarted.connect(self.theme_changed.emit)
+        header.addWidget(self.theme_toggle)
         root.addLayout(header)
 
         self.save_btn.clicked.connect(self._save_project)
@@ -116,28 +195,38 @@ class NewScrapeScreen(QWidget):
         config_layout.setSpacing(14)
         scroll.setWidget(config_widget)
 
-        config_layout.addWidget(self._build_quick_start_section())
-        config_layout.addWidget(self._build_sources_section())
-        config_layout.addWidget(self._build_target_section())
-        config_layout.addWidget(self._build_extraction_section())
+        # hero: the whole setup in one visual sentence
+        config_layout.addWidget(self._build_hero_section())
 
-        # Fetcher mode / proxy / headers are exactly the settings a
-        # non-technical user has no reason to touch - LOGY's defaults
-        # (Fast/HTTP, no proxy, sensible timeouts) work for most targets.
-        # Hidden by default; one checkbox reveals them for power users.
-        self.advanced_toggle_chk = QCheckBox("Show Advanced Options (fetcher mode, proxy, headers, timeouts...)")
-        self.advanced_toggle_chk.toggled.connect(self._toggle_advanced_sections)
-        config_layout.addWidget(self.advanced_toggle_chk)
-
+        # everything else: collapsed accordion rows
+        self.acc = Accordion()
+        self.acc.add_row(
+            "sources", "sources", "Data sources", "where LOGY pulls leads from",
+            self._sources_summary(), self._build_sources_section(), expanded=True,
+        )
+        self.acc.add_row(
+            "links", "links", "Search links", "generated for you",
+            "auto-filled per city", self._build_target_section(),
+        )
+        self.acc.add_row(
+            "table", "table", "Lead details", "the columns you get",
+            "Standard columns · + Quality", self._build_extraction_section(),
+        )
+        adv_content = QWidget()
+        adv_layout = QVBoxLayout(adv_content)
+        adv_layout.setContentsMargins(0, 0, 0, 0)
+        adv_layout.setSpacing(14)
         self.options_section = self._build_options_section()
         self.proxy_section = self._build_proxy_section()
         self.intel_section = self._build_intelligence_section()
-        config_layout.addWidget(self.options_section)
-        config_layout.addWidget(self.proxy_section)
-        config_layout.addWidget(self.intel_section)
-        self.options_section.setVisible(False)
-        self.proxy_section.setVisible(False)
-        self.intel_section.setVisible(False)
+        adv_layout.addWidget(self.options_section)
+        adv_layout.addWidget(self.proxy_section)
+        adv_layout.addWidget(self.intel_section)
+        self.acc.add_row(
+            "sliders", "sliders", "Advanced", "safe defaults — change only if you need",
+            "Protection: rotating · Pace: balanced", adv_content,
+        )
+        config_layout.addWidget(self.acc)
 
         config_layout.addStretch(1)
 
@@ -152,138 +241,138 @@ class NewScrapeScreen(QWidget):
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, 1)
 
-    # ------------------------------------------------------------------
-    # QUICK START (for non-technical users): pick your ICP niche, LOGY
-    # fills in the output columns and turns on auto-qualification for you.
-    # You still need to paste in target URLs and, for now, the CSS/XPath
-    # selectors for those URLs (the click-to-select Selector Assistant
-    # isn't built yet - see README "Known gaps"). This section removes
-    # every OTHER decision a beginner would otherwise have to make.
-    # ------------------------------------------------------------------
-    def _build_quick_start_section(self) -> QWidget:
-        w, layout = card("Quick Start - pick your niche")
-        note = QLabel(
-            "Choose the type of business you're prospecting. LOGY sets the output columns "
-            "(name, phone, website, address, city) and turns on automatic lead qualification "
-            "(flags businesses with no website / a weak website) for you."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #8B95A7; font-size: 11px;")
-        layout.addWidget(note)
+        # ---- footer hint strip (concept foot-hint) ----
+        foot = QFrame()
+        foot.setObjectName("footHint")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(24, 7, 24, 7)
+        fl.setSpacing(8)
+        self.foot_dot = QLabel()
+        self.foot_dot.setFixedSize(8, 8)
+        self.foot_dot.setObjectName("footDotOk")
+        fl.addWidget(self.foot_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        ft1 = QLabel("Protected connection")
+        ft1.setObjectName("footHintStrong")
+        fl.addWidget(ft1)
+        ft2 = QLabel("· encrypted on your device")
+        ft2.setObjectName("footHintText")
+        fl.addWidget(ft2)
+        fl.addStretch(1)
+        ft3 = QLabel("Ctrl+↵ start · Ctrl+E export")
+        ft3.setObjectName("footHintText")
+        fl.addWidget(ft3)
+        root.addWidget(foot)
 
-        row = QHBoxLayout()
+    # ------------------------------------------------------------------
+    # HERO: the whole setup in one visual sentence. Niche, cities and
+    # reach are inline glass pills; the technical rest lives in the
+    # accordion below (sources / links / details / advanced).
+    # ------------------------------------------------------------------
+    def refresh_button_icons(self):
+        from app.ui import theme as ui_theme
+        dark = ui_theme.current() == "dark"
+        muted = "#8FA3C0" if dark else "#5A6073"
+        danger = "#FF8B8B" if dark else "#DC2626"
+        self.save_btn.setIcon(icons.icon("save", muted, 17))
+        self.start_btn.setIcon(icons.icon("play", "#FFFFFF", 17))
+        self.pause_btn.setIcon(icons.icon("pause", muted, 17))
+        self.stop_btn.setIcon(icons.icon("stop", danger, 17))
+        if hasattr(self, "export_btn"):
+            self.export_btn.setIcon(icons.icon("export", muted, 17))
+
+    def _build_hero_section(self) -> QWidget:
+        w = QWidget()
+        w.setObjectName("heroCard")
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
+
+        kicker = QLabel("NEW CAMPAIGN")
+        kicker.setObjectName("heroKicker")
+        kf = kicker.font()
+        kf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.6)
+        kicker.setFont(kf)
+        layout.addWidget(kicker)
+
+        # line 1: Find [niche] in [cities]
+        line1 = QHBoxLayout()
+        line1.setSpacing(8)
+        l1 = QLabel("Find")
+        l1.setObjectName("heroText")
+        line1.addWidget(l1)
+
         self.niche_combo = QComboBox()
+        self.niche_combo.setObjectName("heroPill")
         self.niche_combo.addItem("Choose a niche...", None)
-        # ONE entry per niche now - "شيل ان يبقى فيه 3 اوبشن لكل نيش ...
-        # من غير ما تقول في الاسم ان هو كذا + كذا + كذا": the user
-        # explicitly does not want to choose yellowpages-only vs Yelp-only
-        # vs "All Sources" per niche, and does not want the combo label to
-        # spell out which sources are combined. Every niche pick now
-        # always combines all 3 sources (yellowpages + Yelp + thumbtack -
-        # see generate_niche_urls_all_sources() in builtin_templates.py)
-        # automatically - the combo's data is just the bare niche name
-        # string, consumed directly by _apply_niche_template() below.
         for niche, fee, _term in ICP_NICHES:
             fee_tag = f"  ({fee})" if fee else ""
             self.niche_combo.addItem(f"{niche}{fee_tag}", niche)
-        apply_btn = QPushButton("Use this niche")
-        apply_btn.setObjectName("primaryButton")
-        apply_btn.clicked.connect(self._apply_niche_template)
-        row.addWidget(self.niche_combo, 1)
-        row.addWidget(apply_btn)
-        layout.addLayout(row)
+        self.niche_combo.currentIndexChanged.connect(self._auto_apply_niche)
+        self.niche_combo.setMaximumWidth(270)
+        self.niche_combo.setMinimumHeight(34)
+        line1.addWidget(self.niche_combo)
 
-        # "بيطلع 10 url بس للمدن كلها! عايز لكل مدينة لوحدها 2000 URL" -
-        # this used to be "How many leads (approx.)": one GLOBAL number
-        # split three ways across yellowpages/Yelp/thumbtack and then
-        # spread breadth-first across the WHOLE city list, so a modest
-        # value divided down to a handful of URLs per source - and
-        # thumbtack (one URL per city, no pagination for its page type)
-        # exhausted its whole share after roughly the first 10 cities.
-        # That's exactly the "10 URLs total, no matter how many cities"
-        # bug report.
-        #
-        # It's now a PER-CITY budget instead - see
-        # generate_niche_urls_per_city() in
-        # app/core/engine/builtin_templates.py: every selected city gets
-        # its OWN shot at up to this many URLs (combining all 3 sources),
-        # independent of every other city, instead of sharing one pool.
-        target_row = QHBoxLayout()
-        target_row.addWidget(QLabel("URLs per city (all sources combined):"))
-        self.target_results_spin = QSpinBox()
-        # Ceiling is generate_niche_urls_per_city()'s own deep-paging
-        # ceiling (DEEP_MAX_PAGES_PER_SOURCE, YP+Yelp alternating, plus
-        # thumbtack's fixed 1) - raising the spinbox past what the
-        # generator can ever actually produce per city would just
-        # silently cap back down with no explanation.
-        self.target_results_spin.setRange(1, 2001)
-        self.target_results_spin.setSingleStep(50)
-        # 2000 matches the "عايز لكل مدينة لوحدها 2000 URL" ask directly -
-        # full coverage of every selected city's own 2000-URL budget by
-        # default, no math required to get there.
-        self.target_results_spin.setValue(2000)
-        target_row.addWidget(self.target_results_spin)
+        l2 = QLabel("in")
+        l2.setObjectName("heroText")
+        line1.addWidget(l2)
 
-        # "خليني اقدر احدد المدن اللي محتاجها و بالتالي دا ينطبق على
-        # اللينكات اللي هتطلع برضة تبقى مخصصة للمدينة دي بس" + "المدن تبقى
-        # في سلايدر فيه كل المدن اللي بنشتغل عليها + سيرش بار فيها" -
-        # restrict every generated URL (any source, niche picked from Quick
-        # Start or from the buttons in the Target section below) to ONLY
-        # the cities checked in the "Choose Cities..." picker dialog (see
-        # app/ui/dialogs/city_picker_dialog.py - a checkable, live-
-        # searchable list of the full CITY_POOL, opened via
-        # _open_city_picker() below), instead of always spreading across
-        # the full top-100 CITY_POOL. self._selected_cities (set in
-        # __init__) holds the current pick; _collect_cities() below is
-        # what every URL-generating call site in this file goes through.
-        cities_row = QHBoxLayout()
-        cities_row.addWidget(QLabel("Cities:"))
-        choose_cities_btn = QPushButton("Choose Cities...")
-        choose_cities_btn.clicked.connect(self._open_city_picker)
-        choose_cities_btn.setToolTip(
+        self.choose_cities_btn = QPushButton("All cities")
+        self.choose_cities_btn.setObjectName("heroPill")
+        self.choose_cities_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.choose_cities_btn.setMinimumHeight(34)
+        self.choose_cities_btn.setMaximumWidth(240)
+        self.choose_cities_btn.setToolTip(
             "Restricts every generated search URL (Quick Start and the Target section's "
             "'Load ... Search Links' buttons) to just the cities you check here, instead of "
             "always spreading across all top 100."
         )
-        cities_row.addWidget(choose_cities_btn)
-        self.cities_summary_label = QLabel("")
-        self.cities_summary_label.setStyleSheet("color: #8B95A7; font-size: 11px;")
-        cities_row.addWidget(self.cities_summary_label)
-        cities_row.addStretch(1)
-        self._update_cities_summary()
+        self.choose_cities_btn.clicked.connect(self._open_city_picker)
+        line1.addWidget(self.choose_cities_btn)
+        line1.addStretch(1)
+        layout.addLayout(line1)
 
-        target_hint = QLabel(
-            "(Applies to EACH selected city separately, not split between them - 2000 here means "
-            "up to 2000 URLs for every single city you've chosen, combining yellowpages.com + "
-            "yelp.com pages + thumbtack.com's one page. No single URL returns more leads than the "
-            "real site's own page size (yellowpages: 30/page, yelp/thumbtack: 10/page) - this "
-            "number controls how many pages deep LOGY goes per city, not leads-per-link. Actual "
-            "totals still depend on how many real businesses exist for this niche in each city.)"
-        )
-        target_hint.setWordWrap(True)
-        target_hint.setStyleSheet("color: #8B95A7; font-size: 11px;")
-        target_row.addWidget(target_hint, 1)
-        layout.addLayout(target_row)
-        layout.addLayout(cities_row)
+        # line 2: — search up to [reach] links per city, across all sources
+        line2 = QHBoxLayout()
+        line2.setSpacing(8)
+        l3 = QLabel("— search up to")
+        l3.setObjectName("heroText")
+        line2.addWidget(l3)
 
-        self.auto_qualify_chk = QCheckBox("Auto-qualify leads (flag weak/missing websites automatically)")
+        self.reach_combo = QComboBox()
+        self.reach_combo.setObjectName("heroPill")
+        for label, value in (("250", 250), ("500", 500), ("1,000", 1000), ("2,000", 2000)):
+            self.reach_combo.addItem(label, value)
+        self.reach_combo.setCurrentIndex(2)
+        self.reach_combo.currentIndexChanged.connect(self._on_reach_changed)
+        self.reach_combo.setMinimumHeight(34)
+        self.reach_combo.setMaximumWidth(150)
+        line2.addWidget(self.reach_combo)
+
+        l4 = QLabel("links per city, across yellowpages, Yelp & Thumbtack combined.")
+        l4.setObjectName("heroText")
+        line2.addWidget(l4)
+        line2.addStretch(1)
+        layout.addLayout(line2)
+
+        # hidden spin keeps the existing per-city budget logic untouched
+        self.target_results_spin = QSpinBox()
+        self.target_results_spin.setRange(1, 2001)
+        self.target_results_spin.setSingleStep(50)
+        self.target_results_spin.setValue(1000)
+        self.target_results_spin.setVisible(False)
+        layout.addWidget(self.target_results_spin)
+
+        toggles_row = QHBoxLayout()
+        toggles_row.setSpacing(26)
+        self.auto_qualify_chk = Switch("Rate lead quality automatically")
         self.auto_qualify_chk.setToolTip(
             "For each result with a website field, LOGY fetches that site and flags it "
             "'no website' / 'weak site' / 'strong site' based on real page signals "
             "(HTTPS, mobile-friendliness, SEO basics). No selector knowledge needed."
         )
-        layout.addWidget(self.auto_qualify_chk)
-
-        # 'اسم البيزنيس + الميل بتاع الاونر + اللينكد ان بروفايل بتاع
-        # الاونر + رقم تليفون الاونر' - Yelp/yellowpages listings never
-        # publish this (only business-level info, at most a business
-        # phone) - the only place it's legitimately public is the lead's
-        # OWN website, so this does one extra AI-read fetch per lead
-        # against its "website" field. See job_manager's
-        # _lookup_owner_contact_info() docstring for exactly why this
-        # isn't the same thing as automated LinkedIn people-search (which
-        # this project still does not do).
-        self.owner_lookup_chk = QCheckBox("Look up owner contact info from each lead's website (AI, needs API key)")
+        self.auto_qualify_chk.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggles_row.addWidget(self.auto_qualify_chk)
+        self.owner_lookup_chk = Switch("Find owner contacts from company sites (AI)")
         self.owner_lookup_chk.setToolTip(
             "For each result with a website field, LOGY fetches that site and asks the AI model "
             "(same provider/key as AI Auto-Extract below) to fill in owner_name / owner_email / "
@@ -292,23 +381,43 @@ class NewScrapeScreen(QWidget):
             "search on LOGY's own initiative. Adds one extra fetch + API call per lead, so a large "
             "run will be slower and cost more API usage."
         )
-        layout.addWidget(self.owner_lookup_chk)
+        self.owner_lookup_chk.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggles_row.addWidget(self.owner_lookup_chk)
+        toggles_row.addStretch(1)
+        layout.addLayout(toggles_row)
 
         self.quick_start_status = QLabel("")
-        self.quick_start_status.setStyleSheet("color: #22C55E; font-size: 11px;")
+        self.quick_start_status.setStyleSheet("color: #2EE6A8; font-size: 12px;")
+        self.quick_start_status.setWordWrap(True)
         layout.addWidget(self.quick_start_status)
+
+        foot = QHBoxLayout()
+        hint = QLabel("Quality checks on · nothing technical required")
+        hint.setObjectName("pageSubtitle")
+        foot.addWidget(hint)
+        foot.addStretch(1)
+        foot.addWidget(self.save_btn)
+        foot.addWidget(self.start_btn)
+        layout.addLayout(foot)
+
+        self._update_cities_summary()
         return w
 
-    def _toggle_advanced_sections(self, checked: bool):
-        self.options_section.setVisible(checked)
-        self.proxy_section.setVisible(checked)
-        self.intel_section.setVisible(checked)
+    def _auto_apply_niche(self):
+        if self.niche_combo.currentData() is not None:
+            self._apply_niche_template()
+            self._apply_max_protection_settings()
+
+    def _on_reach_changed(self, index: int):
+        value = self.reach_combo.itemData(index)
+        if value:
+            self.target_results_spin.setValue(int(value))
 
     # ------------------------------------------------------------------
     # INTELLIGENCE (brain.py) - identity memory, pacing, cache, sitemap, PoW
     # ------------------------------------------------------------------
     def _build_intelligence_section(self) -> QWidget:
-        w, layout = card("Intelligence (يحفظ ويتعلم عبر الجريات)")
+        w, layout = card("")
         sel_row = QHBoxLayout()
         sel_row.addWidget(QLabel("Selection"))
         self.selection_combo = QComboBox()
@@ -324,29 +433,30 @@ class NewScrapeScreen(QWidget):
         self.pacing_combo = QComboBox()
         self.pacing_combo.addItems([
             "Fixed delay (classic)",
-            "Adaptive - AIMD (يتعلم سرعة كل نطاق)",
-            "Human-burst (إيقاع بشري ذاتي الاستثارة)",
+            "Adaptive — learns each site's speed",
+            "Human-like bursts (self-excited rhythm)",
         ])
         layout.addWidget(self.pacing_combo)
 
-        self.identity_memory_chk = QCheckBox("Identity memory - سمعة كل هوية + cooldown + sticky per domain (محفوظة عبر الجريات)")
+        self.identity_memory_chk = QCheckBox("Identity memory — per-identity reputation, cooldown, sticky per domain (persisted)")
         self.identity_memory_chk.setChecked(True)
         layout.addWidget(self.identity_memory_chk)
 
-        self.response_cache_chk = QCheckBox("Response cache - ETag/304: الـ re-runs ميطلبش نفس الصفحات تاني")
+        self.response_cache_chk = QCheckBox("Response cache — ETag/304 skips pages seen in earlier runs")
         layout.addWidget(self.response_cache_chk)
 
-        self.sitemap_chk = QCheckBox("Sitemap discovery - اجمع الروابط من sitemap.xml بدل صفحات البحث المحمية")
+        self.sitemap_chk = QCheckBox("Sitemap discovery — collect links from sitemap.xml instead of protected search pages")
         layout.addWidget(self.sitemap_chk)
 
-        self.pow_chk = QCheckBox("Detect JS proof-of-work walls (تجريبي)")
+        self.pow_chk = QCheckBox("Detect JS proof-of-work walls (experimental)")
         layout.addWidget(self.pow_chk)
 
         note = QLabel(
-            "Identity memory بيحتفظ بسمعة كل هوية (Beta posterior) وبيتجنب المبلوكة 5 دقايق بدل ما يرميها، "
-            "وبيثبت هوية لكل نطاق زي البني آدم، وكل هوية ليها fingerprint ثابت (UA + لغة + توقيت).\n"
-            "AIMD: ×0.9 عند نجاح و×2 عند بلوك - بيلاقي السرعة المثالية لكل نطاق لوحده. "
-            "Human-burst: فترات الطلبات بتتشكل من عملية ذاتية الاستثارة (bursts + هدوء) بدل فواصل منتظمة مكشوفة."
+            "Identity memory keeps a reputation per identity (Beta posterior), avoids blocked ones for 5 minutes "
+            "instead of discarding them, and sticks one identity per domain like a human would. Each identity "
+            "has a stable fingerprint (UA + language + timing).\n"
+            "AIMD: x0.9 on success, x2 on block — it finds the sweet spot per site. Human-burst: request gaps "
+            "are self-excited (bursts + quiet) instead of evenly spaced machine-like gaps."
         )
         note.setStyleSheet("color: #8B95A7; font-size: 11px;")
         note.setWordWrap(True)
@@ -354,7 +464,7 @@ class NewScrapeScreen(QWidget):
         return w
 
     # ------------------------------------------------------------------
-    # SOURCES - "خليني اقدر من جوا اضيف مصادر جديدة": lets the user
+    # SOURCES - user ye2dar yezawed sources men gowa el app:
     # define a new scraping source (domain + container/fields selectors,
     # optionally a 2nd-fetch detail_config) from inside the app instead
     # of editing app/core/engine/builtin_templates.py by hand. Saved
@@ -363,8 +473,20 @@ class NewScrapeScreen(QWidget):
     # get_all_source_profiles() - see _get_source_profiles() above -
     # everywhere a multi-source ("All Sources") run is built.
     # ------------------------------------------------------------------
+    def _sources_summary(self) -> str:
+        try:
+            profiles = self._get_source_profiles()
+        except Exception:
+            return "3 built-in ready"
+        built = sum(1 for p in profiles if p.get("verified", True))
+        custom = len(profiles) - built
+        text = f"{built} built-in ready"
+        if custom:
+            text += f" + {custom} custom"
+        return text
+
     def _build_sources_section(self) -> QWidget:
-        w, layout = card("Sources")
+        w, layout = card("")
         note = QLabel(
             "Sites LOGY can pull leads from in an 'All Sources' run. yellowpages.com, yelp.com and "
             "thumbtack.com are all captured live and ready to use. Note: thumbtack.com never publicly "
@@ -377,13 +499,20 @@ class NewScrapeScreen(QWidget):
         note.setStyleSheet("color: #8B95A7; font-size: 11px;")
         layout.addWidget(note)
 
+        self.sources_frame = QFrame()
+        self.sources_frame.setObjectName("tablePanel")
+        sf = QVBoxLayout(self.sources_frame)
+        sf.setContentsMargins(8, 4, 8, 4)
         self.sources_list = QListWidget()
         self.sources_list.setFixedHeight(120)
-        layout.addWidget(self.sources_list)
+        self.sources_list.setItemDelegate(SourceListDelegate(self.sources_list))
+        self.sources_list.setIconSize(QSize(1, 1))
+        sf.addWidget(self.sources_list)
+        layout.addWidget(self.sources_frame)
 
         row = QHBoxLayout()
-        add_btn = QPushButton("+ Add Source")
-        add_btn.setObjectName("primaryButton")
+        add_btn = PrimaryButton("Add source")
+        add_btn.setIcon(icons.icon("new", "#FFFFFF", 16))
         add_btn.clicked.connect(self._add_source)
         self.edit_source_btn = QPushButton("Edit")
         self.edit_source_btn.clicked.connect(self._edit_source)
@@ -402,16 +531,27 @@ class NewScrapeScreen(QWidget):
     def _refresh_sources_list(self):
         self.sources_list.clear()
         custom_rows = self.db.list_custom_sources()
+        BADGE = {"yellowpages": ("Y", "y"), "yelp": ("Yp", "r"), "thumbtack": ("T", "b")}
         for profile in self._get_source_profiles():
             custom_row = next(
                 (r for r in custom_rows if r["name"] == profile["name"] and r["domain"] == profile["domain"]),
                 None,
             )
-            badge = "" if profile.get("verified", True) else "  ⚠ selectors not confirmed"
-            kind = "custom" if custom_row else "built-in"
-            item = QListWidgetItem(f"{profile['name']}  ({profile['domain']})  [{kind}]{badge}")
+            if custom_row:
+                badge = ("@", "m")
+            else:
+                badge = BADGE.get(profile["name"], (profile["name"][:1].upper(), "m"))
+            kind = "Custom" if custom_row else "Built-in · Ready"
+            unverified = "" if profile.get("verified", True) else "  ·  selectors not confirmed"
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, custom_row["id"] if custom_row else None)
+            item.setData(Qt.ItemDataRole.UserRole + 1, profile["name"])
+            item.setData(Qt.ItemDataRole.UserRole + 2, profile["domain"])
+            item.setData(Qt.ItemDataRole.UserRole + 3, badge[0])
+            item.setData(Qt.ItemDataRole.UserRole + 4, badge[1])
+            item.setData(Qt.ItemDataRole.UserRole + 5, kind + unverified)
             self.sources_list.addItem(item)
+        self.acc.set_summary("sources", self._sources_summary())
 
     def _add_source(self):
         dialog = SourceDialog(self)
@@ -431,7 +571,7 @@ class NewScrapeScreen(QWidget):
     def _edit_source(self):
         source_id = self._selected_custom_source_id()
         if source_id is None:
-            QMessageBox.information(self, "Edit Source", "اختار مصدر مضاف من عندك الأول (المصادر الأساسية مش قابلة للتعديل من هنا).")
+            QMessageBox.information(self, "Edit Source", "Pick one of your own custom sources first (built-in sources can't be edited here).")
             return
         row = next(r for r in self.db.list_custom_sources() if r["id"] == source_id)
         existing = {
@@ -451,9 +591,9 @@ class NewScrapeScreen(QWidget):
     def _delete_source(self):
         source_id = self._selected_custom_source_id()
         if source_id is None:
-            QMessageBox.information(self, "Delete Source", "اختار مصدر مضاف من عندك الأول (المصادر الأساسية مش قابلة للحذف).")
+            QMessageBox.information(self, "Delete Source", "Pick one of your own custom sources first (built-in sources can't be deleted).")
             return
-        reply = QMessageBox.question(self, "Delete Source", "متأكد إنك عايز تمسح المصدر ده؟")
+        reply = QMessageBox.question(self, "Delete Source", "Delete this source?")
         if reply == QMessageBox.StandardButton.Yes:
             self.db.delete_custom_source(source_id)
             self._refresh_sources_list()
@@ -467,7 +607,10 @@ class NewScrapeScreen(QWidget):
     def _update_cities_summary(self):
         n = len(self._selected_cities)
         total = len(CITY_POOL)
-        self.cities_summary_label.setText(f"All {total} cities" if n == total else f"{n} of {total} cities")
+        if n == total:
+            self.choose_cities_btn.setText(f"All {total} cities")
+        else:
+            self.choose_cities_btn.setText(f"{n} of {total} cities")
 
     def _collect_cities(self) -> list[tuple[str, str]] | None:
         """Cities picked via the 'Choose Cities...' dialog (see
@@ -505,8 +648,7 @@ class NewScrapeScreen(QWidget):
         start_urls (see generate_niche_urls_all_sources()), instead of the
         user running one source, exporting, running another, and merging
         CSVs by hand - and without a separate "All Sources" option to
-        choose (see _apply_niche_template() above and "شيل ان يبقى فيه 3
-        اوبشن لكل نيش ... المصادر من ال 3 مواقع ... بشكل تلقائي"). The
+        choose (see _apply_niche_template() above - kol niche bygeeb kol el masader automatic). The
         Field Builder / container inputs below are only the FALLBACK
         job_manager uses for a URL that matches neither known domain
         (shouldn't happen with this generator's own output) - the real
@@ -543,9 +685,9 @@ class NewScrapeScreen(QWidget):
         # generate_niche_urls_all_sources() below only knows how to
         # generate URLs for yellowpages/Yelp/thumbtack themselves.
         self._active_source_profiles = source_profiles
-        self._apply_yelp_anti_block_settings()  # this run includes yelp.com URLs too
+        self._apply_max_protection_settings()  # this run includes yelp.com URLs too
 
-        # "لكل مدينة لوحدها 2000 URL" - generate_niche_urls_per_city()
+        # budget l kol medina leha nafsaha - generate_niche_urls_per_city()
         # gives every selected city its OWN up-to-target_count budget
         # (see the spinbox's comment above / that function's docstring),
         # instead of generate_niche_urls_all_sources()' shared global
@@ -565,28 +707,26 @@ class NewScrapeScreen(QWidget):
             thumbtack_count = len(start_urls) - yp_count - yelp_count
             city_count = len(cities) if cities else len(CITY_POOL)
             self.quick_start_status.setText(
-                f"✓ '{niche_name}' جاهز - {len(start_urls)} رابط بحث على {city_count} مدينة (لحد "
-                f"{urls_per_city} رابط لكل مدينة على حدة: {yp_count} من yellowpages.com + "
-                f"{yelp_count} من yelp.com + {thumbtack_count} من thumbtack.com) في نفس القائمة تحت. "
-                "كل رابط هياخد السلكتور بتاعه الصح أوتوماتيك حسب مصدره - مش محتاج تشغلهم واحد واحد ولا "
-                "تدمج نتايجهم بنفسك. ملحوظة: ولا رابط من التلاتة هيرجّع 50 ليد لوحده - أعلى حاجة "
-                "yellowpages.com بترجعها فى الصفحة الواحدة هي 30، وyelp/thumbtack بيرجعوا 10 - العدد "
-                "اللي بتحطه فوق بيتحكم في عمق الصفحات لكل مدينة (كام صفحة يدخلها) مش في عدد الليدز في "
-                "اللينك الواحد. ليدز thumbtack.com هتيجي فيها اسم البيزنس + التقييم + لينك بروفايل بس "
-                "(مفيش تليفون ولا موقع - الموقع نفسه مش بينشرهم للعامة أصلاً)، وبعض النيتشات (زي "
-                "الأطباء/المحامين/وكلاء السيارات) ممكن مايكونش ليها تصنيف حقيقي في thumbtack فتطلع صفر "
-                "ليدز منه بس المصدرين التانيين هيغطوها عادي. دوس Start Scraping على طول."
+                f"'{niche_name}' is ready — {len(start_urls)} search links across {city_count} cities (up to "
+                f"{urls_per_city} per city: {yp_count} from yellowpages.com + "
+                f"{yelp_count} from yelp.com + {thumbtack_count} from thumbtack.com) in the list below. "
+                "Each link picks its own template automatically — no need to run sources one by one or merge "
+                "results by hand. Note: none of the three returns 50 leads per link — the per-page max is "
+                "30 on yellowpages.com and 10 on yelp/thumbtack — this number controls how deep LOGY goes "
+                "per city, not leads per link. Thumbtack leads carry name + rating + profile link only "
+                "(no phone/website — the site doesn't publish them publicly), and some niches have no real "
+                "Thumbtack category so it may return zero leads, but the other two cover them. Start Campaign now."
             )
         else:
             self.quick_start_status.setText(
-                f"تعذر توليد روابط لـ '{niche_name}' - جرب نيتش تاني أو قلل عدد الليدز المطلوب."
+                f"Couldn't generate links for '{niche_name}' — try another niche or lower the reach."
             )
 
     # ------------------------------------------------------------------
     # STEP 1: TARGET
     # ------------------------------------------------------------------
     def _build_target_section(self) -> QWidget:
-        w, layout = card("Target")
+        w, layout = card("")
 
         self.urls_input = QPlainTextEdit()
         self.urls_input.setPlaceholderText("https://example.com\nhttps://example.com/products\nhttps://example.com/about")
@@ -706,9 +846,9 @@ class NewScrapeScreen(QWidget):
         self._active_source_profiles = None
         QMessageBox.information(
             self, "Example Test Sites",
-            "دي مواقع تجربة عامة اتعملت أصلاً عشان مطوري الـ scrapers يتمرنوا عليها - مش مصادر ليدز حقيقية.\n\n"
-            "استخدمها تتأكد إن LOGY شغال من أول لآخر (fetch → extract → export)، وبعدين حط رابط حقيقي "
-            "لموقعك المستهدف الفعلي.",
+            "These are public practice sites built for scraper developers — not real lead sources.\n\n"
+            "Use them to confirm LOGY works end to end (fetch, extract, export), then point it at "
+            "your real target.",
         )
 
     # Live yellowpages.com search-results pages for 7 of the user's own
@@ -750,30 +890,40 @@ class NewScrapeScreen(QWidget):
         always falling back to the small fixed 7-niche demo."""
         return self.niche_combo.currentData()
 
-    def _apply_yelp_anti_block_settings(self):
-        """A real 500-page Yelp run reported back HTTP 403 on ~everything
-        past the first few dozen pages (0 records from 91 fetched pages) -
-        Yelp's bot-detection clearly does more than check headers at any
-        real volume, and FAST_HTTP (a plain HTTP request, options.headers
-        + stealthy_headers=True but no actual browser fingerprint at all)
-        isn't enough past a small number of requests. Two changes, applied
-        together whenever a job includes Yelp URLs:
-        1. Switch Fetcher Mode to Stealth Browser - a real, harder-to-
-           fingerprint browser context (scrapling_adapter.fetch_one()'s
-           STEALTH_BROWSER branch), instead of a raw HTTP request.
-        2. Set a real delay between requests - "Delay between requests" in
-           Advanced Options was being collected from the UI but never
-           actually applied anywhere in job_manager's fetch loop (a real
-           bug, now fixed there too) - hammering yelp.com with zero pacing
-           between hundreds of requests is exactly what a WAF is built to
-           catch.
-        Neither is a guarantee Yelp won't still block a very large run -
-        Yelp actively defends against scraping - but this is a materially
-        better chance than what just got 403'd on nearly everything."""
-        idx = self.fetcher_combo.findData(FetcherMode.STEALTH_BROWSER)
+    def _apply_max_protection_settings(self):
+        """The 'best chance of actually getting leads' preset, applied as
+        soon as a niche is picked (and whenever directory links load):
+
+        1. Connection stays "Automatic" (fast HTTP) - the engine now
+           routes per SOURCE instead of per JOB: yelp/thumbtack profiles
+           declare STEALTH for themselves (real browser, WAF), while
+           yellowpages pages keep the fast lane (2-4s instead of 5-27s).
+           The per-page WAF rescue escalates on demand for anything else.
+        2. A real pause between requests (>= 2000 ms) - hammering a source
+           back-to-back is exactly what bot detection is built to catch
+           (the original 500-page Yelp run that got 403 on ~everything).
+        3. The intelligence layer fully on: human-like burst pacing,
+           identity memory (persisted per-identity reputation) and UCB1
+           selection - blocked identities get skipped instantly and the
+           healthiest one is preferred next request. Burst gaps are
+           capped relative to the user's delay so "human rhythm" can't
+           silently become 30s-per-request.
+        4. Cloudflare handling, 2 retries, 20s timeout, cross-job dedupe.
+
+        Everything here is a FLOOR (max()/setChecked), never lowering a
+        value the user set manually - and everything stays user-editable
+        afterwards."""
+        idx = self.fetcher_combo.findData(FetcherMode.FAST_HTTP)
         if idx >= 0:
             self.fetcher_combo.setCurrentIndex(idx)
         self.delay_spin.setValue(max(2000, self.delay_spin.value()))
+        self.pacing_combo.setCurrentIndex(2)      # human-like bursts
+        self.selection_combo.setCurrentIndex(0)   # sticky + weighted (UCB1 kept for power users)
+        self.identity_memory_chk.setChecked(True)
+        self.solve_cloudflare_chk.setChecked(True)
+        self.retries_spin.setValue(max(2, self.retries_spin.value()))
+        self.timeout_spin.setValue(max(20, self.timeout_spin.value()))
+        self.skip_duplicates_chk.setChecked(True)
 
     def _load_niche_single_source(self, niche_name: str, source: str) -> list[str]:
         """Shared by _load_real_directory_links() / _load_yelp_directory_links()
@@ -782,7 +932,7 @@ class NewScrapeScreen(QWidget):
         this one source ('yellowpages' or 'yelp'), using the "How many
         leads" control's value - the same generator Quick Start's "Use
         this niche" uses, just reachable directly from the Target section
-        without an extra click. 'دلوقيت الاقي 200 لينك في الكونتينر' -
+        without an extra click. (el user kain 3ayez links aktar fe kol medina) -
         the small fixed-city demo lists below are for when NO niche is
         picked yet (a quick 'does this even work' check), not the real
         per-niche generator."""
@@ -796,7 +946,7 @@ class NewScrapeScreen(QWidget):
         self._active_source_profiles = None  # single source - no per-URL resolution needed
         self.auto_qualify_chk.setChecked(True)
         if source == "yelp":
-            self._apply_yelp_anti_block_settings()
+            self._apply_max_protection_settings()
 
         # Same per-city budget as Quick Start's combined flow (see
         # _apply_all_sources_niche() above / generate_niche_urls_per_city()'s
@@ -817,17 +967,15 @@ class NewScrapeScreen(QWidget):
         # A niche is already picked in Quick Start above - generate ITS
         # full top-100-city yellowpages.com list instead of the small
         # fixed 7-niche demo below (see _current_niche_name_from_combo()'s
-        # docstring - this is the fix for "100 مدينة يعني الاقي 200 لينك
-        # ... انما ال 14 لينك دول اعمل بيهم ايه؟").
+        # docstring - da se7 el user kan 3ayez links aktar men el demo list).
         niche_name = self._current_niche_name_from_combo()
         if niche_name:
             urls = self._load_niche_single_source(niche_name, "yellowpages")
             QMessageBox.information(
                 self, "Real Directory Search Links",
-                f"'{niche_name}' مختار في Quick Start فوق - عشان كدا اتحط {len(urls)} رابط حقيقي من "
-                "yellowpages.com يغطوا أول صفحة لكل الـ100 مدينة (وأكتر لو 'How many leads' مرفوع أعلى)، "
-                "مش الـ7 نيتشات التجريبية. auto-qualify اتفعّل معاهم تلقائي.\n\n"
-                "دوس Start Scraping على طول.",
+                f"'{niche_name}' is selected in Quick Start above — so {len(urls)} real yellowpages.com links "
+                "were loaded covering the first page of all 100 cities (more if reach is raised), not the "
+                "7 demo niches. Auto-quality is on.\n\nStart Campaign now.",
             )
             return
         self.urls_input.setPlainText("\n".join(self.REAL_DIRECTORY_SEARCH_LINKS))
@@ -845,14 +993,14 @@ class NewScrapeScreen(QWidget):
         self.extraction_tabs.setCurrentIndex(self.TAB_CUSTOM)
         QMessageBox.information(
             self, "Real Directory Search Links",
-            "دول 7 لينكات حقيقية اتأكدت إنها شغالة دلوقتي (yellowpages.com، اتفحصت ببروزر حقيقي مش أداة "
-            "آلية بس) وبترجع نتايج فعلية لـ 7 من النيتشات بتاعتك - ده اختبار سريع لمدينة واحدة لكل نيتش، "
-            "مش تغطية الـ100 مدينة.\n\n"
-            "عشان تغطية كاملة لنيتش واحد بس (كل الـ100 مدينة)، اختار النيتش من Quick Start فوق الأول "
-            "ثم دوس الزرار ده تاني - هيتحط لينكات النيتش دا بس على الـ100 مدينة بدل السبعة دول.\n\n"
-            "الـ 'Repeat over' وسلكتورات الحقول (business_name / phone / website / address / city) "
-            "اتحطوا أوتوماتيك في تاب Custom Selector - مش محتاج تعمل Inspect Element ولا تكتب حاجة. "
-            "auto-qualify اتفعّل تلقائي. دوس Start Scraping على طول.",
+            "These are 7 verified working yellowpages.com links (checked in a real browser, not automated) "
+            "returning real results for 7 of your niches — a quick one-city-per-niche test, not full "
+            "100-city coverage.\n\n"
+            "For full coverage of one niche, pick it in Quick Start above, then press this button again — "
+            "it loads that niche's links for all 100 cities instead of these seven.\n\n"
+            "The 'Repeat over' and field selectors (business_name / phone / website / address / city) were "
+            "filled automatically on the Custom Selector tab — no Inspect Element needed. Auto-quality is on. "
+            "Start Campaign now.",
         )
 
     # Live yelp.com search-results pages for 7 of the user's own ICP
@@ -881,14 +1029,13 @@ class NewScrapeScreen(QWidget):
             urls = self._load_niche_single_source(niche_name, "yelp")
             QMessageBox.information(
                 self, "Yelp Search Links",
-                f"'{niche_name}' مختار في Quick Start فوق - عشان كدا اتحط {len(urls)} رابط حقيقي من "
-                "yelp.com يغطوا أول صفحة لكل الـ100 مدينة، مش الـ7 نيتشات التجريبية. فتش رقم التليفون "
-                "التاني اتفعّل، وكمان auto-qualify.\n\n"
-                "⚠️ يلب بيحظر الطلبات الكتير بسهولة (اتأكدنا من كده - ران فعلي رجّع HTTP 403 على كل "
-                "حاجة تقريبًا). عشان كدا Fetcher Mode اتحول لـ 'Stealth Browser' والـ 'Delay between "
-                "requests' اتحط على 2 ثانية على الأقل - ده هيخلي الرن أبطأ لكن الفرصة إنه ينجح أكبر "
-                "بكتير. حتى كده، مفيش ضمان 100% - يلب دايمًا بيحاول يمنع أي سكرابينج.\n\n"
-                "دوس Start Scraping على طول.",
+                f"'{niche_name}' is selected in Quick Start above — so {len(urls)} real yelp.com links were "
+                "loaded covering the first page of all 100 cities, not the 7 demo niches. The second "
+                "phone fetch is on, and auto-quality.\n\n"
+                "Note: Yelp blocks heavy traffic easily (a real run got HTTP 403 on nearly everything). "
+                "Connection was switched to the protected browser and the pause between requests set to "
+                "at least 2 seconds — slower run, much better odds. No 100% guarantee — Yelp actively "
+                "resists scraping.\n\nStart Campaign now.",
             )
             return
         self.urls_input.setPlainText("\n".join(self.YELP_REAL_DIRECTORY_SEARCH_LINKS))
@@ -899,25 +1046,24 @@ class NewScrapeScreen(QWidget):
         self._active_detail_config = YELP_DETAIL_CONFIG
         self._active_source_profiles = None  # single source - no per-URL resolution needed
         self.auto_qualify_chk.setChecked(True)
-        self._apply_yelp_anti_block_settings()
+        self._apply_max_protection_settings()
         self.extraction_tabs.setCurrentIndex(self.TAB_CUSTOM)
         QMessageBox.information(
             self, "Yelp Search Links",
-            "دول 7 لينكات حقيقية من yelp.com لـ 7 من النيتشات بتاعتك، بنفس المدن اللي في زرار "
-            "yellowpages فوق - ده اختبار سريع لمدينة واحدة لكل نيتش، مش تغطية الـ100 مدينة.\n\n"
-            "عشان تغطية كاملة لنيتش واحد بس (كل الـ100 مدينة)، اختار النيتش من Quick Start فوق الأول "
-            "ثم دوس الزرار ده تاني.\n\n"
-            "الـ 'Repeat over' وسلكتور اسم الشركة اتحطوا أوتوماتيك في تاب Custom Selector. رقم "
-            "التليفون مش موجود في صفحة نتايج البحث نفسها في يلب - عشان كدا LOGY هيعمل فتش تاني لكل "
-            "بيزنس من صفحته الخاصة في يلب عشان يجيب رقم التليفون (السكرابينج هياخد وقت أطول شوية عشان "
-            "كدا). auto-qualify اتفعّل تلقائي.\n\n"
-            "⚠️ Fetcher Mode اتحول لـ 'Stealth Browser' والـ delay بين الطلبات اتحط 2 ثانية على الأقل - "
-            "يلب بيحظر بسهولة على FAST/HTTP، ده بيقلل احتمال الحظر بس مش بيضمنه 100%.\n\n"
-            "دوس Start Scraping على طول.",
+            "These are 7 real yelp.com links for 7 of your niches, same cities as the yellowpages button "
+            "above — a quick one-city-per-niche test, not 100-city coverage.\n\n"
+            "For full coverage of one niche, pick it in Quick Start above, then press this button again.\n\n"
+            "'Repeat over' and the business-name selector were filled automatically on the Custom "
+            "Selector tab. Phone numbers aren't on Yelp's search results page — LOGY will do a second "
+            "fetch per business from its own Yelp page to get the phone (slightly slower). Auto-quality "
+            "is on.\n\n"
+            "Note: connection switched to the protected browser and the pause between requests set to at "
+            "least 2 seconds — Yelp blocks FAST/HTTP easily; this lowers the odds of blocks but is no "
+            "guarantee.\n\nStart Campaign now.",
         )
 
     def _load_all_sources_directory_links(self):
-        """'كل اللينكات الممكنة في وقت واحد مش يمشي عليها واحد واحد' -
+        """(load kol el links marratt wa7da) -
         put BOTH yellowpages.com AND yelp.com links in the SAME urls_input
         box at once and run them as one job, instead of the user loading
         one source, running it, exporting, then loading the other source
@@ -932,8 +1078,7 @@ class NewScrapeScreen(QWidget):
         delegates to _apply_all_sources_niche() for THAT ONE niche's full
         top-100-city, both-sources list - see
         _current_niche_name_from_combo()'s docstring. That's the fix for
-        "100 مدينة يعني الاقي 200 لينك في الكونتينر انما ال 14 لينك دول
-        اعمل بيهم ايه؟": the 14-link list below is a fixed 7-niche demo
+        (el user kan 3ayez links aktar men el 14 demo): the 14-link list below is a fixed 7-niche demo
         (1 city each), never meant to BE the 100-city coverage."""
         niche_name = self._current_niche_name_from_combo()
         if niche_name:
@@ -965,19 +1110,17 @@ class NewScrapeScreen(QWidget):
         self._active_detail_config = None  # handled per-URL via source_profiles instead
         self._active_source_profiles = source_profiles
         self.auto_qualify_chk.setChecked(True)
-        self._apply_yelp_anti_block_settings()  # this run includes yelp.com URLs too
+        self._apply_max_protection_settings()  # this run includes yelp.com URLs too
         self.extraction_tabs.setCurrentIndex(self.TAB_CUSTOM)
         QMessageBox.information(
             self, "All Sources (combined)",
-            f"اتحطت {len(combined)} رابط في نفس القائمة - {len(self.REAL_DIRECTORY_SEARCH_LINKS)} من "
-            f"yellowpages.com و{len(self.YELP_REAL_DIRECTORY_SEARCH_LINKS)} من yelp.com، لـ 7 نيتشات "
-            "بتاعتك (مدينة واحدة لكل نيتش - اختبار سريع، مش تغطية الـ100 مدينة).\n\n"
-            "عشان تغطية كاملة لنيتش واحد بس (كل الـ100 مدينة، المصدرين مع بعض)، اختار النيتش من Quick "
-            "Start فوق الأول (أي واحد من التلاتة) ثم دوس الزرار ده تاني - هيتحط لينكات النيتش دا بس على "
-            "الـ100 مدينة تلقائي.\n\n"
-            "كل رابط هياخد السلكتور الصح بتاعه أوتوماتيك حسب مصدره وقت السحب - مش هتحتاج تشغل كل "
-            "مصدر لوحده ولا تدمج النتايج بنفسك. auto-qualify اتفعّل تلقائي.\n\n"
-            "دوس Start Scraping على طول.",
+            f"{len(combined)} links loaded in the same list — {len(self.REAL_DIRECTORY_SEARCH_LINKS)} from "
+            f"yellowpages.com and {len(self.YELP_REAL_DIRECTORY_SEARCH_LINKS)} from yelp.com, for 7 of "
+            "your niches (one city each — quick test, not 100-city coverage).\n\n"
+            "For full coverage of one niche (all 100 cities, both sources), pick it in Quick Start above "
+            "then press this button again — it loads that niche's links for all 100 cities automatically.\n\n"
+            "Each link picks its own template automatically at fetch time — no need to run sources "
+            "separately or merge results by hand. Auto-quality is on. Start Campaign now.",
         )
 
     # houzz.com - a real, large US directory (1,499+ pros just for "Kitchen
@@ -1048,19 +1191,20 @@ class NewScrapeScreen(QWidget):
 
         QMessageBox.information(
             self, "Houzz Search Links",
-            f"اتحطت {len(self.HOUZZ_SEARCH_LINKS)} روابط بحث حقيقية من houzz.com، بس لـ 5 نيتشات بس "
-            "من الـ 15 بتاعتك (Houzz دليل تصميم وتجديد منازل - معندوش تصنيف لسولار أو إصلاح أساسات أو "
-            "عزل مائي أو حفر، ولا للنيتشات المهنية زي المحامين والأطباء).\n\n"
-            "Houzz مبني بطريقة الكلاسات فيها بتتغير عشوائيًا كل ما الموقع يتحدث - فمفيش Custom Selector "
-            "ثابت ممكن يفضل شغال. عشان كدا الزرار ده حوّل الشاشة لوضع 'AI Auto-Extract' ومفعّل 'Follow "
-            "Links' - LOGY هيسحب صفحة النتايج، يلاقي فيها روابط بروفايلات الشركات، ويدخل كل بروفايل "
-            "لوحده ويستخرج بياناته بالذكاء الاصطناعي (رقم التليفون والعنوان بيظهروا في نص الصفحة "
-            "بشكل مباشر - اتأكدت من كده على صفحة حقيقية).\n\n"
-            "⚠️ لازم يكون عندك مفتاح API لـ Anthropic أو OpenAI محفوظ في شاشة API Keys الأول، وإلا LOGY "
-            "هيرفض يبدأ ويقولك. كل صفحة بروفايل بتتفتح هتكلفك استدعاء API حقيقي (مش مجاني زي yellowpages "
-            "و yelp).\n\n"
-            "حدود صريحة: دول أول صفحة نتايج بس لكل تصنيف (~15 شركة)، ومفيش فلترة حقيقية بالمدينة - "
-            "Houzz بيرجع نفس القائمة القومية مهما غيرت المدينة في الرابط (اتأكدت من كده بنفسي)."
+            f"{len(self.HOUZZ_SEARCH_LINKS)} real houzz.com search links loaded — but only for 5 of your 15 "
+            "niches (Houzz is a home-renovation directory — no solar, foundation repair, waterproofing "
+            "or excavation categories, and none for professional niches like attorneys or dentists).\n\n"
+            "Houzz regenerates its class names randomly on every deploy — no stable Custom Selector can "
+            "survive. So this button switches the job to 'AI Auto-Extract' with 'Follow Links' on — "
+            "LOGY pulls the results page, finds the company profile links, opens each profile and "
+            "extracts its data with AI (phone and address appear directly in page text — verified on a "
+            "real page).\n\n"
+            "Note: requires an Anthropic or OpenAI API key saved on the AI Setup screen first, or LOGY "
+            "refuses to start. Each profile page opened costs a real API call (not free like "
+            "yellowpages or yelp).\n\n"
+            "Straight limits: first results page only per category (~15 companies), and no real city "
+            "filtering — Houzz returns the same nationwide list regardless of the city in the link "
+            "(verified personally)."
         )
 
     # ------------------------------------------------------------------
@@ -1072,7 +1216,7 @@ class NewScrapeScreen(QWidget):
     TAB_AI, TAB_SMART, TAB_CUSTOM, TAB_SCHEMA = 0, 1, 2, 3
 
     def _build_extraction_section(self) -> QWidget:
-        w, layout = card("Data to Extract")
+        w, layout = card("")
 
         self.extraction_tabs = QTabWidget()
 
@@ -1174,7 +1318,7 @@ class NewScrapeScreen(QWidget):
     def _generate_smart_fields(self):
         fields = generate_fields(self.smart_description.toPlainText())
         if not fields:
-            QMessageBox.information(self, "Smart Extraction", "لم يتم التعرف على أي حقول من الوصف. جرّب وصف أوضح.")
+            QMessageBox.information(self, "Smart Extraction", "No fields recognized from the description. Try a clearer one.")
             return
         self.field_builder.load_fields(fields)
         self.extraction_tabs.setCurrentIndex(self.TAB_CUSTOM)  # jump to Custom Selector so the user fills in selectors
@@ -1182,29 +1326,29 @@ class NewScrapeScreen(QWidget):
     def _validate_schema(self):
         ok, err, parsed = validate_json_schema(self.schema_input.toPlainText())
         if ok:
-            self.schema_status_label.setText(f"✓ Schema صالح - {len(parsed)} حقل")
+            self.schema_status_label.setText(f"Valid schema — {len(parsed)} fields")
             self.schema_status_label.setStyleSheet("color: #22C55E;")
             fields = [ExtractionField(name=k, selector="") for k in parsed.keys()]
             self.field_builder.load_fields(fields)
         else:
-            self.schema_status_label.setText(f"✗ {err}")
+            self.schema_status_label.setText(f"Invalid: {err}")
             self.schema_status_label.setStyleSheet("color: #EF4444;")
 
     # ------------------------------------------------------------------
     # STEP 3: SCRAPING OPTIONS
     # ------------------------------------------------------------------
     def _build_options_section(self) -> QWidget:
-        w, layout = card("Scraping Options")
+        w, layout = card("")
 
         form = QFormLayout()
         self.fetcher_combo = QComboBox()
-        self.fetcher_combo.addItem("Fast / HTTP", FetcherMode.FAST_HTTP)
-        self.fetcher_combo.addItem("Dynamic Browser", FetcherMode.DYNAMIC_BROWSER)
-        self.fetcher_combo.addItem("Stealth Browser (anti-bot)", FetcherMode.STEALTH_BROWSER)
-        form.addRow("Fetcher mode", self.fetcher_combo)
+        self.fetcher_combo.addItem("Automatic (recommended)", FetcherMode.FAST_HTTP)
+        self.fetcher_combo.addItem("Browser mode", FetcherMode.DYNAMIC_BROWSER)
+        self.fetcher_combo.addItem("Protected browser (anti-block)", FetcherMode.STEALTH_BROWSER)
+        form.addRow("Connection", self.fetcher_combo)
         layout.addLayout(form)
 
-        # "هيستوري لليدز اللي طلعت مسبقا متتكررش كل ما نجينيريت ليدز" - skip
+        # mat5alish lead tezhar marat keter - skip
         # a lead this run extracts if ANY earlier job already produced it
         # (matched by email/phone/website/name+company - see
         # app/core/engine/dedupe.py). Checked against the History screen's
@@ -1220,15 +1364,19 @@ class NewScrapeScreen(QWidget):
         )
         layout.addWidget(self.skip_duplicates_chk)
 
-        toolbox = QToolBox()
         advanced = QWidget()
         adv_form = QFormLayout(advanced)
 
-        self.headless_chk = QCheckBox("Headless")
+        self.headless_chk = QCheckBox("Run browser in background")
         self.headless_chk.setChecked(True)
-        self.network_idle_chk = QCheckBox("Wait for network idle")
-        self.disable_resources_chk = QCheckBox("Disable images/CSS/fonts (faster)")
-        self.solve_cloudflare_chk = QCheckBox("Auto-solve Cloudflare (Stealth mode only)")
+        self.network_idle_chk = QCheckBox("Wait for pages to settle")
+        self.disable_resources_chk = QCheckBox("Skip heavy assets (faster)")
+        self.solve_cloudflare_chk = QCheckBox("Handle tough sites automatically")
+        self.block_ads_chk = QCheckBox("Block ads & trackers (~3,500 domains)")
+        self.dns_over_https_chk = QCheckBox("DNS-over-HTTPS (no DNS leaks on proxies)")
+        self.real_chrome_chk = QCheckBox("Use real installed Chrome (stealth)")
+        self.use_sessions_chk = QCheckBox("Persistent sessions (cookies + connection reuse)")
+        self.use_sessions_chk.setChecked(True)
 
         self.concurrency_spin = QSpinBox()
         self.concurrency_spin.setRange(1, 64)
@@ -1255,30 +1403,33 @@ class NewScrapeScreen(QWidget):
         adv_form.addRow(self.network_idle_chk)
         adv_form.addRow(self.disable_resources_chk)
         adv_form.addRow(self.solve_cloudflare_chk)
-        adv_form.addRow("Concurrency", self.concurrency_spin)
-        adv_form.addRow("Delay between requests", self.delay_spin)
+        adv_form.addRow(self.block_ads_chk)
+        adv_form.addRow(self.dns_over_https_chk)
+        adv_form.addRow(self.real_chrome_chk)
+        adv_form.addRow(self.use_sessions_chk)
+        adv_form.addRow("Parallel requests", self.concurrency_spin)
+        adv_form.addRow("Pause between requests", self.delay_spin)
         adv_form.addRow("Timeout", self.timeout_spin)
-        adv_form.addRow("Retry count", self.retries_spin)
+        adv_form.addRow("Retries", self.retries_spin)
         adv_form.addRow("Request headers", self.headers_input)
         adv_form.addRow("Cookies", self.cookies_input)
 
-        toolbox.addItem(advanced, "Advanced Options")
-        layout.addWidget(toolbox)
+        layout.addWidget(advanced)
         return w
 
     # ------------------------------------------------------------------
     # PROXY
     # ------------------------------------------------------------------
     def _build_proxy_section(self) -> QWidget:
-        w, layout = card("Proxy")
+        w, layout = card("")
         self.proxy_mode_combo = QComboBox()
         self.proxy_mode_combo.addItems([
-            "No proxy",
-            "Single proxy",
-            "Proxy list",
+            "Standard connection",
+            "Fixed connection",
+            "Rotating pool",
             "Rotating",
-            "Tor (anonymous - through local Tor)",
-            "Hybrid: proxies + Tor (يفتح المواقع اللي بتمنع تور)",
+            "Maximum privacy",
+            "Maximum (recommended)",
         ])
         self.proxy_list_input = QPlainTextEdit()
         self.proxy_list_input.setPlaceholderText("http://user:pass@host:port  (one per line)")
@@ -1300,7 +1451,7 @@ class NewScrapeScreen(QWidget):
         self.tor_control_spin.setRange(1, 65535)
         self.tor_control_spin.setValue(9051)
         tor_row.addWidget(self.tor_control_spin)
-        tor_row.addWidget(QLabel("Rotate IP every"))
+        tor_row.addWidget(QLabel("Refresh connection every"))
         self.tor_rotate_spin = QSpinBox()
         self.tor_rotate_spin.setRange(0, 1000)
         self.tor_rotate_spin.setValue(10)
@@ -1313,11 +1464,9 @@ class NewScrapeScreen(QWidget):
         layout.addWidget(self.tor_row_widget)
 
         self.proxy_note = QLabel(
-            "Proxy credentials are encrypted at rest and never written to logs or exports.\n"
-            "Tor mode: شغّل Tor Browser (أو tor.exe) قبل التشغيل - كل الريكويستات هتعدي على شبكة Tor "
-            "والـ IP هيتغير تلقائياً كل فترة. المواقع مش هتشوف الـ IP الحقيقي.\n"
-            "Hybrid mode: البروكسيات بتاعتك + Tor في نفس التناوب - لما موقع يبلوك هوية (403/Cloudflare) "
-            "الريكويست الجاي يطلع من هوية تانية غير مبلوكة. ده اللي بيفتح المواقع اللي بتمنع Tor exit nodes."
+            "Your connection details are encrypted on your device only — never written to logs or exports.\n"
+            "Maximum privacy mode: start Tor Browser (or tor.exe) before running — all traffic goes through the Tor network and the identity changes automatically.\n"
+            "Maximum mode: your proxies + Tor in one rotation — when a site stops a request, the next one exits from a different, unblocked connection."
         )
         self.proxy_note.setStyleSheet("color: #8B95A7; font-size: 11px;")
         layout.addWidget(self.proxy_note)
@@ -1334,45 +1483,98 @@ class NewScrapeScreen(QWidget):
     # ------------------------------------------------------------------
     def _build_run_panel(self) -> QWidget:
         w, layout = card("")
+        w.setObjectName("runPanel")
+        layout.setContentsMargins(16, 14, 16, 14)
 
+        # trading-desk status strip: pill + KPIs + controls
         status_row = QHBoxLayout()
+        status_row.setSpacing(16)
         self.status_label = QLabel("IDLE")
         self.status_label.setObjectName("statusRunning")
-        self.progress_bar = QProgressBar()
-        self.pages_label = QLabel("Pages: 0 / 0")
-        self.records_label = QLabel("Records: 0")
-        self.success_label = QLabel("Success: 0")
-        self.failed_label = QLabel("Failed: 0")
-        self.elapsed_label = QLabel("Elapsed: 00:00:00")
-        for lbl in (self.status_label, self.pages_label, self.records_label,
-                    self.success_label, self.failed_label, self.elapsed_label):
-            status_row.addWidget(lbl)
+        status_row.addWidget(self.status_label)
+
+        self.campaign_hint = QLabel("Campaign in progress")
+        self.campaign_hint.setObjectName("pageSubtitle")
+        status_row.addWidget(self.campaign_hint)
         status_row.addStretch(1)
+
+        self.progress_bar = QProgressBar()
+
+        _, self.pages_label = self._make_kpi(status_row, "SEARCHED", "0 / 0")
+        _, self.records_label = self._make_kpi(status_row, "LEADS", "0")
+        _, self.success_label = self._make_kpi(status_row, "SAVED", "0")
+        _, self.failed_label = self._make_kpi(status_row, "BLOCKED & RETRIED", "0")
+        _, self.elapsed_label = self._make_kpi(status_row, "TIME", "00:00:00")
+        status_row.addStretch(1)
+
+        self.pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        status_row.addWidget(self.pause_btn)
+        status_row.addWidget(self.stop_btn)
+        self.export_btn = QPushButton("Get my leads")
+        self.export_btn.clicked.connect(self._export_results)
+        self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        status_row.addWidget(self.export_btn)
         layout.addLayout(status_row)
         layout.addWidget(self.progress_bar)
 
         body_split = QSplitter(Qt.Orientation.Horizontal)
 
-        self.log_panel = LogPanel()
-        body_split.addWidget(self.log_panel)
+        feed_wrap = QWidget()
+        feed_layout = QVBoxLayout(feed_wrap)
+        feed_layout.setContentsMargins(0, 0, 0, 0)
+        feed_layout.setSpacing(6)
+        feed_header = QHBoxLayout()
+        feed_title = QLabel("Activity")
+        feed_title.setObjectName("feedTitle")
+        feed_header.addWidget(feed_title)
+        feed_header.addStretch(1)
+        self.detailed_log_btn = QPushButton("Detailed log")
+        self.detailed_log_btn.setObjectName("feedLink")
+        self.detailed_log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.detailed_log_btn.clicked.connect(self._open_detailed_log)
+        feed_header.addWidget(self.detailed_log_btn)
+        feed_layout.addLayout(feed_header)
+
+        feed_frame = QFrame()
+        feed_frame.setObjectName("feedPanel")
+        feed_frame_lay = QVBoxLayout(feed_frame)
+        feed_frame_lay.setContentsMargins(10, 8, 10, 8)
+        self.log_panel = ActivityFeed()
+        feed_frame_lay.addWidget(self.log_panel)
+        feed_layout.addWidget(feed_frame, 1)
+        body_split.addWidget(feed_wrap)
 
         results_wrap = QWidget()
         results_layout = QVBoxLayout(results_wrap)
         results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(6)
         results_header = QHBoxLayout()
-        self.results_count_label = QLabel("Results Preview - 0 rows")
-        export_btn = QPushButton("⇩ Export")
-        export_btn.clicked.connect(self._export_results)
+        self.results_count_label = QLabel("Latest leads — 0 collected")
+        self.results_count_label.setObjectName("feedTitle")
         results_header.addWidget(self.results_count_label)
         results_header.addStretch(1)
-        results_header.addWidget(export_btn)
         results_layout.addLayout(results_header)
 
+        table_frame = QFrame()
+        table_frame.setObjectName("tablePanel")
+        table_frame_lay = QVBoxLayout(table_frame)
+        table_frame_lay.setContentsMargins(10, 8, 10, 8)
         self.results_view = QTableView()
         self.results_view.setAlternatingRowColors(True)
         self.results_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.results_view.horizontalHeader().setStretchLastSection(True)
-        results_layout.addWidget(self.results_view)
+        self.results_view.setShowGrid(False)
+        self.results_view.setWordWrap(False)  # one elided line per cell, no double-height rows
+        vh = self.results_view.verticalHeader()
+        vh.setVisible(False)          # concept table has no row-number gutter
+        vh.setDefaultSectionSize(34)  # roomy rows instead of cramped 20px
+        hh = self.results_view.horizontalHeader()
+        hh.setFixedHeight(36)
+        hh.setMinimumSectionSize(96)
+        hh.setStretchLastSection(True)
+        self._pill_delegate = QualityPillDelegate(self.results_view)
+        table_frame_lay.addWidget(self.results_view)
+        results_layout.addWidget(table_frame)
         body_split.addWidget(results_wrap)
         body_split.setStretchFactor(0, 1)
         body_split.setStretchFactor(1, 2)
@@ -1380,13 +1582,30 @@ class NewScrapeScreen(QWidget):
         layout.addWidget(body_split, 1)
         return w
 
+    def _open_detailed_log(self):
+        self.open_logs.emit()
+
+    def _make_kpi(self, row, micro: str, initial: str) -> tuple[QWidget, QLabel]:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(1)
+        m = QLabel(micro)
+        m.setObjectName("kpiMicro")
+        val = QLabel(initial)
+        val.setObjectName("kpiValue")
+        v.addWidget(m)
+        v.addWidget(val)
+        row.addWidget(box)
+        return box, val
+
     # ------------------------------------------------------------------
     # collecting config from the form
     # ------------------------------------------------------------------
     def _collect_target(self) -> TargetConfig | None:
         valid, invalid = parse_url_list(self.urls_input.toPlainText())
         if not valid:
-            QMessageBox.warning(self, "Target", "لازم تدخل رابط واحد صحيح على الأقل.")
+            QMessageBox.warning(self, "Target", "Enter at least one valid URL.")
             return None
         return TargetConfig(
             start_urls=valid,
@@ -1407,9 +1626,9 @@ class NewScrapeScreen(QWidget):
         if not fields:
             QMessageBox.warning(
                 self, "Data to Extract",
-                "لازم يكون فيه حقل واحد على الأقل بسلكتور فعلي في تبويب Custom Selector.\n"
-                "لو استخدمت Smart Extraction أو JSON Schema، اضبط السلكتورات هناك الأول.\n"
-                "أو فعّل AI Auto-Extract لو عايز تشتغل من غير سلكتورات خالص.",
+                "Need at least one field with a real selector on the Custom Selector tab.\n"
+                "If you used Smart Extraction or JSON Schema, set the selectors there first.\n"
+                "Or turn on AI Auto-Extract to work without selectors at all.",
             )
             return None
         return fields
@@ -1451,7 +1670,7 @@ class NewScrapeScreen(QWidget):
             return AIExtractionConfig(enabled=False, provider=self._effective_ai_provider())
         field_names = [f.strip() for f in self.ai_fields_input.text().split(",") if f.strip()]
         if not field_names:
-            QMessageBox.warning(self, "AI Auto-Extract", "لازم تحدد حقل واحد على الأقل تحت AI Auto-Extract.")
+            QMessageBox.warning(self, "AI Auto-Extract", "Pick at least one field under AI Auto-Extract.")
             return None
         return AIExtractionConfig(
             enabled=True,
@@ -1485,6 +1704,10 @@ class NewScrapeScreen(QWidget):
             solve_cloudflare=self.solve_cloudflare_chk.isChecked(),
             network_idle=self.network_idle_chk.isChecked(),
             disable_resources=self.disable_resources_chk.isChecked(),
+            block_ads=self.block_ads_chk.isChecked(),
+            dns_over_https=self.dns_over_https_chk.isChecked(),
+            real_chrome=self.real_chrome_chk.isChecked(),
+            use_sessions=self.use_sessions_chk.isChecked(),
             headers=headers,
             cookies=cookies,
             proxy=ProxyConfig(
@@ -1529,14 +1752,19 @@ class NewScrapeScreen(QWidget):
         }
         name = f"Project {self.db.list_projects().__len__() + 1}"
         project_id = self.db.create_project(name, config)
-        QMessageBox.information(self, "Saved", f"تم حفظ المشروع باسم: {name}")
+        QMessageBox.information(self, "Saved", f"Project saved as: {name}")
 
     def _options_to_dict(self, options: ScrapeOptions) -> dict:
+        from app.core.storage import secrets as _secrets
         d = dict(options.__dict__)
+        d.pop("proxy", None)  # rebuilt below - credentials never in plain JSON (audit C2)
         d["fetcher_mode"] = options.fetcher_mode.value
         d["proxy"] = {
             "mode": options.proxy.mode,
-            "proxies": options.proxy.proxies,
+            # credentials live encrypted-at-rest; a redacted copy stays
+            # readable for display/round-trip sanity checks
+            "proxies_encrypted": _secrets.encrypt_proxy_list(options.proxy.proxies),
+            "proxies_redacted": [_secrets.SecretStore.redact(p) for p in options.proxy.proxies],
             "tor_socks_port": options.proxy.tor_socks_port,
             "tor_control_port": options.proxy.tor_control_port,
             "tor_rotate_every": options.proxy.tor_rotate_every,
@@ -1545,6 +1773,7 @@ class NewScrapeScreen(QWidget):
             "enabled": options.ai_extraction.enabled,
             "field_names": options.ai_extraction.field_names,
             "provider": options.ai_extraction.provider,
+            "ai_call_budget": options.ai_extraction.ai_call_budget,
         }
         return d
 
@@ -1553,11 +1782,11 @@ class NewScrapeScreen(QWidget):
         return bool(keys.get(provider))
 
     def _start_scraping(self):
-        if not engine.SCRAPLING_AVAILABLE:
+        if not engine.ENGINE_AVAILABLE:
             QMessageBox.critical(
                 self, "Engine not ready",
-                f"Scrapling مش مثبت في البيئة دي.\n\n{engine.SCRAPLING_IMPORT_ERROR}\n\n"
-                "شغّل: pip install scrapling && scrapling install",
+                f"the fetch engine isn't installed in this environment.\n\n{engine.ENGINE_IMPORT_ERROR}\n\n"
+                "Run: pip install scrapling && scrapling install",
             )
             return
 
@@ -1573,16 +1802,16 @@ class NewScrapeScreen(QWidget):
         if self.ai_enabled_chk.isChecked() and not self._resolve_ai_api_key_present(options.ai_extraction.provider):
             QMessageBox.warning(
                 self, "AI Auto-Extract",
-                f"مفيش مفتاح API متسجل باسم '{options.ai_extraction.provider}' في شاشة API Keys.\n"
-                "ضيفه الأول، أو بدّل لـ Custom Selector.",
+                f"No API key saved as '{options.ai_extraction.provider}' on AI Setup.\n"
+                "Add it first, or switch to Custom Selector.",
             )
             return
         if self.owner_lookup_chk.isChecked() and not self._resolve_ai_api_key_present(options.ai_extraction.provider):
             QMessageBox.warning(
                 self, "Owner Lookup",
-                f"'Look up owner contact info' محتاج مفتاح API متسجل باسم '{options.ai_extraction.provider}' "
-                "في شاشة API Keys الأول (اختار المزوّد من تاب AI Auto-Extract لو عايز تغيّره).\n"
-                "ضيفه الأول، أو بطّل الخانة دي.",
+                f"'Find owner contacts' needs an API key saved as '{options.ai_extraction.provider}' "
+                "on AI Setup (pick the provider on the AI Auto-Extract tab to change it).\n"
+                "Add it first, or turn this option off.",
             )
             return
         container = self._collect_container()
@@ -1590,10 +1819,11 @@ class NewScrapeScreen(QWidget):
         self.run_panel.setVisible(True)
         self.log_panel.clear()
         self.status_label.setText("RUNNING")
+        self.campaign_hint.setText("Collecting leads · auto-protected")
         self.start_btn.setVisible(False)
         self.pause_btn.setVisible(True)
         self.stop_btn.setVisible(True)
-        self.pause_btn.setText("⏸ Pause")
+        self.pause_btn.setText("Pause")
 
         # prepare_job() builds the worker/thread but does NOT start it -
         # every signal below gets connected first, THEN
@@ -1615,9 +1845,56 @@ class NewScrapeScreen(QWidget):
 
         self.results_model = ResultsTableModel(self.db, job_id)
         self.results_view.setModel(self.results_model)
+        self._bind_quality_pills()
+
+        # start from a clean, moving bar: 0% now, real percentage as the
+        # progress signal reports done/known-work, 100% on finish
+        self.progress_bar.setValue(0)
+        self.pages_label.setText("0 / 0")
+        self.records_label.setText("0")
+        self.success_label.setText("0")
+        self.failed_label.setText("0")
 
         self._elapsed_timer = self.startTimer(1000)
 
+        self.job_manager.start_prepared_job()
+
+    def _resume_job(self, job_id: int):
+        """Resume an INTERRUPTED job from its checkpoint (audit C3/H1):
+        same signal wiring as a fresh start, but JobManager builds the
+        worker from the persisted spec + remaining pending queue."""
+        if self.job_manager.is_running:
+            QMessageBox.information(self, "Resume", "مهمة تانية شغالة دلوقتي - أوقفها الأول.")
+            return
+        try:
+            job_id, worker = self.job_manager.prepare_resume_job(job_id)
+        except RuntimeError as e:
+            QMessageBox.warning(self, "Resume", str(e))
+            return
+
+        self.run_panel.setVisible(True)
+        self.log_panel.clear()
+        self.status_label.setText("RUNNING")
+        self.campaign_hint.setText("Resuming interrupted campaign · auto-protected")
+        self.start_btn.setVisible(False)
+        self.pause_btn.setVisible(True)
+        self.stop_btn.setVisible(True)
+        self.pause_btn.setText("Pause")
+        self.current_job_id = job_id
+        self._job_start_ts = __import__("time").time()
+
+        worker.log.connect(self._on_log)
+        worker.progress.connect(self._on_progress)
+        worker.result_ready.connect(self._on_result)
+        worker.status_changed.connect(self._on_status_changed)
+        worker.finished.connect(self._on_finished)
+
+        self.results_model = ResultsTableModel(self.db, job_id)
+        self.results_view.setModel(self.results_model)
+        self._bind_quality_pills()
+        self.progress_bar.setValue(0)
+
+        self._elapsed_timer = self.startTimer(1000)
         self.job_manager.start_prepared_job()
 
     def timerEvent(self, event):
@@ -1626,12 +1903,14 @@ class NewScrapeScreen(QWidget):
             elapsed = int(time.time() - self._job_start_ts)
             h, rem = divmod(elapsed, 3600)
             m, s = divmod(rem, 60)
-            self.elapsed_label.setText(f"Elapsed: {h:02}:{m:02}:{s:02}")
+            self.elapsed_label.setText(f"{h:02}:{m:02}:{s:02}")
 
     def _toggle_pause(self):
-        currently_paused = self.pause_btn.text().startswith("▶")
+        currently_paused = self.pause_btn.text() == "Resume"
         self.job_manager.pause(not currently_paused)
-        self.pause_btn.setText("▶ Resume" if not currently_paused else "⏸ Pause")
+        from app.ui.widgets import icons as _ic
+        self.pause_btn.setText("Resume" if not currently_paused else "Pause")
+        self.pause_btn.setIcon(_ic.icon("play" if not currently_paused else "pause", "#8FA3C0", 17))
 
     def _stop_scraping(self):
         self.job_manager.stop()
@@ -1640,17 +1919,46 @@ class NewScrapeScreen(QWidget):
         self.log_panel.append_entry(level, message)
 
     def _on_progress(self, pages_done, pages_total, records_ok, records_failed):
-        self.pages_label.setText(f"Pages: {pages_done} / {pages_total}")
-        self.records_label.setText(f"Records: {records_ok + records_failed}")
-        self.success_label.setText(f"Success: {records_ok}")
-        self.failed_label.setText(f"Failed: {records_failed}")
+        self.pages_label.setText(f"{pages_done} / {pages_total}")
+        self.records_label.setText(f"{records_ok + records_failed}")
+        self.success_label.setText(f"{records_ok}")
+        self.failed_label.setText(f"{records_failed}")
         if pages_total:
             self.progress_bar.setValue(int(pages_done / pages_total * 100))
 
     def _on_result(self, record: dict):
         if self.results_model:
             self.results_model.append_live_result()
-            self.results_count_label.setText(f"Results Preview - {self.results_model.total_count} rows")
+            self._bind_quality_pills()
+            self.results_count_label.setText(f"Latest leads — {self.results_model.total_count} collected")
+
+    def _bind_quality_pills(self):
+        # auto-qualify saves digital_label; that column only appears after the
+        # first qualified record, so re-bind after every model reset
+        if not self.results_model:
+            return
+        for col, name in enumerate(self.results_model._columns):
+            if "digital_label" in name or "quality" in name:
+                self.results_view.setItemDelegateForColumn(col, self._pill_delegate)
+                self.results_view.horizontalHeader().resizeSection(col, 130)
+        self._fit_result_columns()
+
+    def _fit_result_columns(self):
+        """Give the early columns usable widths (business name / phone / site
+        get squeezed to ~100px otherwise) while throttling the pass so a
+        1,000-row run doesn't re-measure on every single result."""
+        model = self.results_model
+        if not model:
+            return
+        total = model.total_count
+        if total not in (0, 1) and total % 10 != 0:
+            return
+        hh = self.results_view.horizontalHeader()
+        for col, name in enumerate(model._columns):
+            hint = self.results_view.sizeHintForColumn(col) + 14
+            cap = 240 if "signals" in name else 150
+            hh.resizeSection(col, min(max(hint, 96), cap))
+        hh.setStretchLastSection(True)
 
     def _on_status_changed(self, status: str):
         self.status_label.setText(status.upper())
@@ -1669,12 +1977,16 @@ class NewScrapeScreen(QWidget):
         self.start_btn.setVisible(True)
         self.pause_btn.setVisible(False)
         self.stop_btn.setVisible(False)
+        # close the bar out: whatever the last emitted percentage was,
+        # the run is over - show it complete rather than frozen mid-way
+        # (early-end/stop paths never emit a final 100% themselves).
+        self.progress_bar.setValue(100)
         if hasattr(self, "_elapsed_timer"):
             self.killTimer(self._elapsed_timer)
 
     def _export_results(self):
         if not self.current_job_id:
-            QMessageBox.information(self, "Export", "مفيش نتائج لسه.")
+            QMessageBox.information(self, "Export", "No results yet.")
             return
         fmt, ok = self._ask_export_format()
         if not ok:
@@ -1683,7 +1995,7 @@ class NewScrapeScreen(QWidget):
         # (see exporter.export_odoo_xlsx / export_odoo_xls) - only the
         # internal EXPORTERS key has the odoo_ prefix, the file extension
         # on disk must match the actual bytes written or Excel/Odoo may
-        # reject or mis-parse it. "عايزه يطلع XLS مش XSLS" - Odoo's own
+        # reject or mis-parse it. (el user 3ayez xls aslan) - Odoo's own
         # downloadable CRM Lead template is itself a "crm_lead 1.xls"
         # file, so that's the default Odoo option now instead of .xlsx.
         ODOO_EXTENSIONS = {"odoo_xlsx": "xlsx", "odoo_xls": "xls"}
@@ -1706,7 +2018,7 @@ class NewScrapeScreen(QWidget):
             extra_kwargs["extra_fields"] = exporter.extra_fields_from_settings(self.db.get_setting)
         try:
             count = exporter.export(fmt, self.db.iter_all_results(self.current_job_id), path, **extra_kwargs)
-            QMessageBox.information(self, "Export", f"تم تصدير {count} سجل إلى:\n{path}")
+            QMessageBox.information(self, "Export", f"Exported {count} records to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
