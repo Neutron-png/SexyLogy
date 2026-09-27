@@ -1,6 +1,6 @@
 """
 Pure validation helpers used by the New Scrape wizard before a job is
-allowed to start. No Qt / no Scrapling imports -> unit-testable.
+allowed to start. No Qt / no the fetch engine imports -> unit-testable.
 """
 from __future__ import annotations
 
