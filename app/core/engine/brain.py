@@ -16,7 +16,7 @@ per-domain pacing. This is the module that makes the crawler *learn*:
 All state survives across jobs in logy.db (identity_stats / domain_stats /
 sticky_identities / response_cache tables) — run N learns from run N-1.
 
-Everything here is deliberately dependency-free (no Qt, no Scrapling) and
+Everything here is deliberately dependency-free (no Qt, no the fetch engine) and
 single-threaded-by-convention: the scrape worker is the only caller, so
 no locks are needed beyond sqlite's own serialization (Database already
 serializes access with an RLock).
@@ -99,6 +99,10 @@ class DomainStat:
     log_odds: float = -2.0            # WAF-pressure state; -2 ≈ P(red) ~12%
     disabled_until: float = 0.0       # circuit breaker expiry (epoch s)
     latencies: deque = field(default_factory=lambda: deque(maxlen=12))
+    # Per-job selector-health signal (audit §4): consecutive fetched pages
+    # that parsed fine but produced zero records. NOT persisted - it's a
+    # within-job degradation detector, reset naturally per Brain instance.
+    consecutive_zero_pages: int = 0
 
     @property
     def red_prob(self) -> float:
@@ -137,7 +141,20 @@ class Brain:
     CREATE TABLE IF NOT EXISTS response_cache (
         url TEXT PRIMARY KEY, etag TEXT DEFAULT '', last_modified TEXT DEFAULT '',
         body TEXT DEFAULT '', fetched_at REAL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS identity_domain_stats (
+        key TEXT NOT NULL, host TEXT NOT NULL,
+        successes INTEGER DEFAULT 0, blocks INTEGER DEFAULT 0,
+        PRIMARY KEY (key, host));
     """
+
+    # Blocks are a RELATIONSHIP between an identity and a target, not a
+    # property of the identity alone (audit H4): yelp burning a proxy says
+    # nothing about that proxy on yellowpages. Pair stats drive per-domain
+    # selection weights; the identity-level aggregate stays for cooldowns.
+    CACHE_MAX_BODY_BYTES = 256 * 1024   # skip caching huge pages entirely
+    CACHE_MAX_ROWS = 20_000
+    CACHE_PRUNE_TO = 15_000
+    CACHE_PRUNE_CHECK_EVERY = 512
 
     def __init__(self, db):
         """db: app.core.storage.db.Database (thread-safe via its RLock)."""
@@ -147,6 +164,8 @@ class Brain:
         self._identities: dict[str, IdentityStat] = {}
         self._domains: dict[str, DomainStat] = {}
         self._sticky: dict[str, str] = {}
+        self._pairs: dict[tuple[str, str], dict[str, int]] = {}
+        self._cache_puts = 0
         self._load()
 
     # ---------------- persistence ----------------
@@ -166,6 +185,15 @@ class Brain:
                 self._domains[stat.host] = stat
             for row in cur.execute("SELECT * FROM sticky_identities").fetchall():
                 self._sticky[row["host"]] = row["identity_key"]
+            for row in cur.execute("SELECT * FROM identity_domain_stats").fetchall():
+                self._pairs[(row["key"], row["host"])] = {
+                    "successes": row["successes"], "blocks": row["blocks"]}
+        # Inherited AIMD decay (audit M: a domain that blocked us days ago
+        # must not open the new job at its full 30s learned delay). Clamp
+        # the persisted delay to a bounded warm start; live AIMD continues
+        # from there within this job.
+        for dom in self._domains.values():
+            dom.delay_ms = min(dom.delay_ms, self.AIMD_START_MS * 4)
 
     def _save_identity(self, s: IdentityStat):
         with self.db.cursor() as cur:
@@ -191,6 +219,26 @@ class Brain:
                 "INSERT INTO sticky_identities(host, identity_key) VALUES(?,?) "
                 "ON CONFLICT(host) DO UPDATE SET identity_key=?",
                 (host, key, key))
+
+    def _pair(self, key: str, host: str) -> dict[str, int]:
+        return self._pairs.setdefault((key, host), {"successes": 0, "blocks": 0})
+
+    def pair_block_prob(self, key: str, host: str) -> float:
+        """Laplace-smoothed P(block) for THIS identity on THIS domain. Falls
+        back to the identity-level posterior when the pair has no evidence
+        yet - so a fresh domain doesn't reset a known-good identity's trust."""
+        pair = self._pairs.get((key, host))
+        if pair and (pair["successes"] + pair["blocks"]) > 0:
+            return (pair["blocks"] + 1) / (pair["successes"] + pair["blocks"] + 2)
+        return self.identity(key).block_prob
+
+    def _save_pair(self, key: str, host: str, pair: dict[str, int]):
+        with self.db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO identity_domain_stats(key, host, successes, blocks) VALUES(?,?,?,?) "
+                "ON CONFLICT(key, host) DO UPDATE SET successes=?, blocks=?",
+                (key, host, pair["successes"], pair["blocks"],
+                 pair["successes"], pair["blocks"]))
 
     # ---------------- identity selection ----------------
     def identity(self, key: str) -> IdentityStat:
@@ -236,14 +284,14 @@ class Brain:
             return self._pick_ucb1(eligible)
 
         if mode != "sticky":
-            weights = [(1.0 - self.identity(k).block_prob) for k in eligible]
+            weights = [max(0.05, 1.0 - self.pair_block_prob(k, host)) for k in eligible]
             return random.choices(eligible, weights=weights, k=1)[0]
 
         sticky_key = self._sticky.get(host)
         if sticky_key and sticky_key in eligible and random.random() < self.STICKINESS:
             return sticky_key
 
-        weights = [(1.0 - self.identity(k).block_prob) for k in eligible]
+        weights = [max(0.05, 1.0 - self.pair_block_prob(k, host)) for k in eligible]
         return random.choices(eligible, weights=weights, k=1)[0]
 
     def _pick_ucb1(self, eligible: list[str]) -> str:
@@ -267,9 +315,10 @@ class Brain:
 
     # ---------------- outcome recording ----------------
     def record(self, key: str, host: str, blocked: bool, latency_s: float = 0.0):
-        """THE learning step. One call updates: the identity's Beta
-        posterior + cooldown, the sticky map, and — via _pressure() — the
-        domain's WAF state, AIMD delay and circuit breaker."""
+        """THE learning step. One call updates: the identity's aggregate
+        Beta posterior + cooldown, the per-(identity, domain) pair stats,
+        the sticky map, and — via _pressure() — the domain's WAF state,
+        AIMD delay and circuit breaker."""
         ident = self.identity(key)
         now = time.time()
         ident.last_used = now
@@ -281,6 +330,13 @@ class Brain:
             if latency_s > 0:
                 ident.avg_latency = (ident.avg_latency * (ident.successes - 1) + latency_s) / ident.successes
         self._save_identity(ident)
+
+        pair = self._pair(key, host)
+        if blocked:
+            pair["blocks"] += 1
+        else:
+            pair["successes"] += 1
+        self._save_pair(key, host, pair)
 
         if not blocked:
             self._sticky[host] = key
@@ -318,6 +374,15 @@ class Brain:
         """Current AIMD delay for the domain, in seconds."""
         return self.domain(host).delay_ms / 1000.0
 
+    def record_page_outcome(self, host: str, had_records: bool) -> int:
+        """Selector-health tracking (audit §4): distinguishes 'the market is
+        empty' (a zero here and there) from 'the extractor is broken'
+        (consecutive zero-record pages on one source). Returns the current
+        consecutive-zero count for the host."""
+        dom = self.domain(host)
+        dom.consecutive_zero_pages = 0 if had_records else dom.consecutive_zero_pages + 1
+        return dom.consecutive_zero_pages
+
     def unlock(self, host: str):
         dom = self.domain(host)
         dom.disabled_until = 0.0
@@ -345,12 +410,27 @@ class Brain:
         return row["body"], headers         # stale: revalidate
 
     def cache_put(self, url: str, html: str, etag: str = "", last_modified: str = ""):
+        # Bounded cache (audit H3): full HTML bodies in SQLite grow the DB
+        # by ~150KB/page - unbounded, a 10k-page run writes gigabytes.
+        # Skip oversized bodies entirely, and periodically prune oldest
+        # rows to keep the table capped.
+        if len(html) > self.CACHE_MAX_BODY_BYTES:
+            return
+        self._cache_puts += 1
         with self.db.cursor() as cur:
             cur.execute(
                 "INSERT INTO response_cache(url, etag, last_modified, body, fetched_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(url) DO UPDATE SET etag=?, last_modified=?, body=?, fetched_at=?",
                 (url, etag, last_modified, html, time.time(),
                  etag, last_modified, html, time.time()))
+            if self._cache_puts % self.CACHE_PRUNE_CHECK_EVERY == 0:
+                count = cur.execute("SELECT COUNT(*) FROM response_cache").fetchone()[0]
+                if count > self.CACHE_MAX_ROWS:
+                    cur.execute(
+                        "DELETE FROM response_cache WHERE url IN ("
+                        "SELECT url FROM response_cache ORDER BY fetched_at ASC LIMIT ?)",
+                        (count - self.CACHE_PRUNE_TO,),
+                    )
 
 
 def _median(values: list[float]) -> float:
