@@ -63,3 +63,40 @@ class SecretStore:
             _, _, host = rest.partition("@")
             return f"{scheme}://***:***@{host}"
         return "***"
+
+
+# ---------------------------------------------------------------- proxy lists
+# Project configs persist a job's proxy list. Those URLs contain credentials,
+# so they go through the SAME encrypted store as API keys - never plain
+# columns/config JSON (audit finding C2).
+
+import json as _json
+
+
+def encrypt_proxy_list(proxies: list[str]) -> str:
+    """Encrypted-at-rest JSON blob for a project's proxy list."""
+    if not proxies:
+        return ""
+    return SecretStore().encrypt(_json.dumps(proxies))
+
+
+def decrypt_proxy_list(blob: str) -> list[str]:
+    if not blob:
+        return []
+    return _json.loads(SecretStore().decrypt(blob))
+
+
+import re as _re
+
+_PROXY_SECRET_RE = _re.compile(
+    r"((?:https?|socks5h?|ftp)://)[^/\s:@]+:[^/\s@]+@"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Central log/exception scrubber: any scheme://user:pass@host pattern
+    becomes scheme://***:***@host. Used by the job manager's single log
+    sink so no credential can reach logy.db or the UI feed."""
+    if not text:
+        return text
+    return _PROXY_SECRET_RE.sub(r"\1***:***@", text)
