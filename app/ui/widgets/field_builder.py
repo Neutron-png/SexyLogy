@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from app.core.models import ExtractionField, ExtractionType
+from app.ui.widgets.buttons import PrimaryButton
 
 COLUMNS = ["Field Name", "Selector", "Type", "Extract As", "Attribute", "Multiple"]
 
@@ -23,8 +24,7 @@ class FieldBuilder(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         toolbar = QHBoxLayout()
-        self.add_btn = QPushButton("+ Add Field")
-        self.add_btn.setObjectName("primaryButton")
+        self.add_btn = PrimaryButton("+ Add Field")
         self.add_btn.clicked.connect(self.add_row)
         self.delete_btn = QPushButton("Delete Selected")
         self.delete_btn.clicked.connect(self.delete_selected)
