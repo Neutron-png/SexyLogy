@@ -181,7 +181,7 @@ scatter the timing beyond easy classification.
 
 - **Behavioral fingerprinting is out of scope.** Targets like Yelp/Cloudflare also model mouse
   movement, request ordering and JS execution — rotation says nothing there; that's the stealth
-  engine's job (Scrapling's Chromium stealth + `solve_cloudflare`).
+  engine's job (the engine's Chromium stealth + `solve_cloudflare`).
 - **Worst case:** a target that blocks every Tor exit *and* every datacenter range leaves only
   **residential proxies** — they lead the ops checklist below.
 - **MAC rotation is not implemented on purpose** — it cannot help against websites.
@@ -218,14 +218,14 @@ scatter the timing beyond easy classification.
 UI (PySide6)
  └─ JobManager (QThread)              app/core/job_manager.py
      ├─ anonymity.py                  # NEW: identity rotation, Tor control, block detection
-     ├─ scrapling_adapter.py          # the ONLY module importing Scrapling
+     ├─ fetch_engine.py          # the ONLY module importing the fetch engine
      ├─ extractor.py / ai_extractor.py
      ├─ dedupe.py                     # cross-job lead history
      └─ storage/db.py (sqlite3, thread-safe)
 ```
 
-- **UI → Job Manager → Scraping Engine → Scrapling** boundary; the UI never touches Scrapling.
-- Scrapling fetcher modes: `FAST_HTTP` (curl-cffi, TLS impersonation), `DYNAMIC` (Chromium),
+- **UI → Job Manager → Scraping Engine → the fetch engine** boundary; the UI never touches the fetch engine.
+- the fetch engine fetcher modes: `FAST_HTTP` (curl-cffi, TLS impersonation), `DYNAMIC` (Chromium),
   `STEALTH` (Chromium stealth, Cloudflare solving).
 - Sources are pluggable profiles (`builtin_templates.py`) — per-site containers/fields/detail configs.
 - AI Auto-Extract mode: no selectors; an LLM reads page text and fills field names
@@ -256,7 +256,7 @@ python tests/run_tests.py        # 102/103 passing (1 pre-existing qualifier fix
 ```
 app/
   core/
-    engine/        # anonymity.py, scrapling_adapter.py, extractor.py, ai_extractor.py,
+    engine/        # anonymity.py, fetch_engine.py, extractor.py, ai_extractor.py,
                    # builtin_templates.py, dedupe.py, qualifier.py, nl_to_fields.py
     job_manager.py # QThread worker: queue, retries, failover, enrichment
     exports/       # CSV / JSON / JSONL / XLSX / Odoo exporters

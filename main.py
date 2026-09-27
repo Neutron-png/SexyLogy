@@ -4,6 +4,8 @@ this is the only place that owns the QApplication lifecycle.
 """
 from __future__ import annotations
 
+import utils.transport
+import utils.session
 import sys
 from pathlib import Path
 
@@ -16,14 +18,13 @@ from PySide6.QtWidgets import QApplication
 
 from app.core.storage.db import Database
 from app.ui.main_window import APP_VERSION, MainWindow
-from app.ui.theme import QSS
+from app.ui import theme as ui_theme
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("LOGY")
     app.setApplicationVersion(APP_VERSION)
-    app.setStyleSheet(QSS)
 
     icon_path = Path(__file__).resolve().parent / "assets" / "logo.ico"
     if icon_path.exists():
@@ -33,6 +34,11 @@ def main() -> int:
     # (same default "logy.db" name the storage layer and tests expect).
     db_path = Path(__file__).resolve().parent / "logy.db"
     db = Database(db_path)
+
+    # Restore the user's saved dark/light preference before the first paint.
+    ui_theme.load_fonts()
+    ui_theme.set_theme(app, db.get_setting("ui_theme", "dark") or "dark")
+
     window = MainWindow(db)
     window.show()
     exit_code = app.exec()
