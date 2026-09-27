@@ -2,7 +2,7 @@
 Core data models for LOGY.
 
 These are plain dataclasses used across the UI, job manager, storage and
-export layers. Keeping them dependency-free (no Qt, no Scrapling imports)
+export layers. Keeping them dependency-free (no Qt, no the fetch engine imports)
 means they can be unit-tested in isolation and reused by any layer.
 """
 from __future__ import annotations
@@ -35,6 +35,7 @@ class JobStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     STOPPED = "stopped"
+    INTERRUPTED = "interrupted"   # app died / power loss mid-run; resumable
 
 
 class LogLevel(str, Enum):
@@ -116,6 +117,9 @@ class AIExtractionConfig:
     enabled: bool = False
     field_names: list[str] = field(default_factory=list)
     provider: str = "anthropic"        # "anthropic" | "openai" - must match a saved API Keys entry name
+    # Hard ceiling on paid AI calls for ONE job (owner-lookup + auto-extract
+    # combined) so a big run can't turn into a surprise bill. 0 = unlimited.
+    ai_call_budget: int = 300
 
 
 @dataclass
@@ -190,6 +194,26 @@ class ScrapeOptions:
     # Per-request persona (UA/locale/timezone), set by the worker for the
     # CURRENT identity exactly like proxies[0] - never logged/exported.
     persona: dict[str, str] = field(default_factory=dict)
+    # --- Official the fetch engine capabilities (docs → Optional Dependencies /
+    # StealthyFetcher params) wired 1:1 into the engine ---
+    # Persistent sessions (FetcherSession/StealthySession): one browser or
+    # connection pool per job instead of one per page - cookies/state
+    # survive across pages, which is both faster and far less bot-like.
+    use_sessions: bool = True
+    # Block ~3,500 known ad/tracker domains inside browser fetches.
+    block_ads: bool = False
+    # Route DNS through Cloudflare DoH - closes the DNS leak that socks5
+    # (without the trailing 'h') leaves open on browser engines.
+    dns_over_https: bool = False
+    # Use the machine's real installed Chrome instead of the bundled
+    # chromium build for stealth fetches (hardest-to-fingerprint option).
+    real_chrome: bool = False
+    # Keep a persistent browser profile per engine (cookies/localStorage
+    # survive across jobs) - the "returning visitor" effect.
+    browser_profile: bool = True
+    # Optional: connect to an already-running browser over CDP instead of
+    # launching one locally (remote/managed browsers).
+    cdp_url: str = ""
 
 
 @dataclass
