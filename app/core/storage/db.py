@@ -1,6 +1,6 @@
 """
 SQLite storage layer. stdlib-only (sqlite3), so it runs anywhere Python
-runs and is fully unit-testable without Qt or Scrapling.
+runs and is fully unit-testable without Qt or the fetch engine.
 
 Stores: projects, job runs (history), job results (row-per-record, kept
 out of the main app.db logic path for large jobs - see results table
@@ -109,6 +109,29 @@ CREATE TABLE IF NOT EXISTS custom_sources (
     detail_config_json TEXT,
     created_at REAL NOT NULL
 );
+
+-- Per-job URL checkpoint: every URL the worker knows about, with its
+-- state. This is what makes a crashed/killed job RESUMABLE - the
+-- remaining 'pending' rows are the exact remaining work, and 'done'
+-- rows are never re-fetched (lead dedupe still guards the other side).
+CREATE TABLE IF NOT EXISTS job_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    depth INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending',  -- pending | in_progress | done | failed | skipped
+    UNIQUE (job_id, url)
+);
+CREATE INDEX IF NOT EXISTS idx_job_queue_state ON job_queue(job_id, state);
+
+-- Serialized job specification (target/fields/options/container/profiles)
+-- captured at start time, so an interrupted job can be reconstructed and
+-- resumed without the New Scrape screen still holding its config.
+CREATE TABLE IF NOT EXISTS job_specs (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    spec_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -142,19 +165,39 @@ class Database:
     def __init__(self, path: str | Path = "logy.db"):
         self.path = str(path)
         self._lock = threading.RLock()
+        self._closed = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # WAL: commits don't block external readers (e.g. the user opening
+        # logy.db in a DB browser mid-run) and crash recovery is fast.
+        # busy_timeout: external long readers degrade to a short wait
+        # instead of an instant SQLITE_BUSY that would kill the worker.
+        try:
+            self._conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.DatabaseError:
+            pass  # e.g. WAL unsupported on the filesystem - keep defaults
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
+    def _assert_open(self):
+        if self._closed:
+            raise RuntimeError(
+                "قاعدة البيانات مغلقة (التطبيق أقفل) - العملية مرفوضة. "
+                "لو شفت الرسالة دي في لوج مهمة، يبقى المهمة استمرت بعد إغلاق التطبيق."
+            )
+
     def close(self):
         with self._lock:
+            self._closed = True
             self._conn.close()
 
     @contextmanager
     def cursor(self) -> Iterator[sqlite3.Cursor]:
         with self._lock:
+            self._assert_open()
             cur = self._conn.cursor()
             try:
                 yield cur
@@ -432,3 +475,97 @@ class Database:
                 "UPDATE templates SET config_json = ? WHERE name = ? AND builtin = 1",
                 (json.dumps(config), name),
             )
+
+    # ---------------- Job resumability (checkpoint + spec) ----------------
+    def set_job_spec(self, job_id: int, spec: dict) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_specs (job_id, spec_json, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET spec_json = excluded.spec_json",
+                (job_id, json.dumps(spec, ensure_ascii=False), time.time()),
+            )
+
+    def get_job_spec(self, job_id: int) -> Optional[dict]:
+        with self.cursor() as cur:
+            row = cur.execute("SELECT spec_json FROM job_specs WHERE job_id = ?", (job_id,)).fetchone()
+        return json.loads(row["spec_json"]) if row else None
+
+    def queue_replace(self, job_id: int, urls: list[tuple[str, int]]) -> None:
+        """Checkpoint the worker's current known queue (url, depth) as the
+        pending work for this job. Called at job start and on resume."""
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM job_queue WHERE job_id = ?", (job_id,))
+            cur.executemany(
+                "INSERT OR IGNORE INTO job_queue (job_id, url, depth, state) VALUES (?, ?, ?, 'pending')",
+                [(job_id, u, d) for u, d in urls],
+            )
+
+    def queue_mark(self, job_id: int, url: str, state: str) -> None:
+        """state: done | failed | skipped | in_progress"""
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE job_queue SET state = ? WHERE job_id = ? AND url = ?",
+                (state, job_id, url),
+            )
+
+    def queue_pending(self, job_id: int) -> list[tuple[str, int]]:
+        """Remaining (url, depth) pairs in queue order - the exact resume set."""
+        with self.cursor() as cur:
+            rows = cur.execute(
+                "SELECT url, depth FROM job_queue WHERE job_id = ? AND state = 'pending' ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        return [(r["url"], r["depth"]) for r in rows]
+
+    def queue_reset_in_progress(self, job_id: int) -> None:
+        """A resume puts rows that were mid-flight when the app died back
+        into 'pending' - their fetch never completed, so they're work."""
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE job_queue SET state = 'pending' WHERE job_id = ? AND state = 'in_progress'",
+                (job_id,),
+            )
+
+    def mark_job_resumed(self, job_id: int) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?",
+                (job_id,),
+            )
+
+    def queue_counts(self, job_id: int) -> dict:
+        with self.cursor() as cur:
+            rows = cur.execute(
+                "SELECT state, COUNT(*) AS n FROM job_queue WHERE job_id = ? GROUP BY state",
+                (job_id,),
+            ).fetchall()
+        return {r["state"]: r["n"] for r in rows}
+
+    def mark_stale_running_as_interrupted(self, older_than_s: float = 90.0) -> list[int]:
+        """Crash recovery sweep: any job still 'running' whose last DB
+        activity is older than the heartbeat window cannot be alive (the
+        app was killed / power lost). Mark it INTERRUPTED and recompute
+        its counters from the actual results table so History matches
+        reality. Called once at app startup."""
+        cutoff = time.time() - older_than_s
+        with self.cursor() as cur:
+            rows = cur.execute(
+                "SELECT id FROM jobs WHERE status = 'running' AND "
+                "NOT EXISTS (SELECT 1 FROM logs WHERE logs.job_id = jobs.id AND logs.ts >= ?)",
+                (cutoff,),
+            ).fetchall()
+            stale = [r["id"] for r in rows]
+            for job_id in stale:
+                cur.execute(
+                    "UPDATE jobs SET status = 'interrupted', "
+                    "finished_at = COALESCE(finished_at, ?) WHERE id = ?",
+                    (time.time(), job_id),
+                )
+                cur.execute(
+                    "UPDATE jobs SET "
+                    "records_ok = (SELECT COUNT(*) FROM results WHERE results.job_id = jobs.id), "
+                    "pages_done = (SELECT COUNT(DISTINCT source_url) FROM results WHERE results.job_id = jobs.id) "
+                    "WHERE id = ?",
+                    (job_id,),
+                )
+        return stale
