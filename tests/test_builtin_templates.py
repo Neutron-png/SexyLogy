@@ -269,15 +269,34 @@ def test_generate_niche_urls_all_sources_restricts_to_given_cities():
     assert all("austin" in u.lower() for u in urls)
 
 
-def test_generate_niche_urls_all_sources_includes_all_three_domains():
+def test_generate_niche_urls_all_sources_excludes_thumbtack_by_default():
+    """Thumbtack went opt-in (2026-09-26): AWS WAF stealth cost of
+    15-150s per URL for at most 1 server-rendered lead per city made its
+    cost/lead the worst in the mix. The default combined list must be
+    yellowpages + yelp only; thumbtack comes back only when asked for."""
     name = next(iter(NICHE_SEARCH_TERMS))
     urls = generate_niche_urls_all_sources(name, target_results=3000)
-    domains = {"yellowpages.com": False, "yelp.com": False, "thumbtack.com": False}
-    for u in urls:
-        for d in domains:
-            if d in u:
-                domains[d] = True
-    assert all(domains.values()), domains
+    assert urls, "expected a non-empty default URL list"
+    assert all("thumbtack.com" not in u for u in urls)
+    assert any("yellowpages.com" in u for u in urls)
+    assert any("yelp.com" in u for u in urls)
+
+
+def test_generate_niche_urls_per_city_thumbtack_only_when_explicit():
+    """Same opt-in rule for the per-city generator: no thumbtack by
+    default, but `sources` still accepts it explicitly."""
+    name = next(iter(NICHE_SEARCH_TERMS))
+    cities = [("Austin", "TX")]
+
+    default_urls = generate_niche_urls_per_city(name, urls_per_city=50, cities=cities)
+    assert all("thumbtack.com" not in u for u in default_urls)
+
+    opt_in = generate_niche_urls_per_city(
+        name, urls_per_city=50, cities=cities,
+        sources=("thumbtack", "yellowpages", "yelp"),
+    )
+    assert any("thumbtack.com" in u for u in opt_in)
+    assert len([u for u in opt_in if "thumbtack.com" in u]) == 1  # 1/city cap intact
 
 
 def test_generate_niche_urls_thumbtack_uses_real_url_pattern():
@@ -324,25 +343,15 @@ def test_generate_niche_urls_per_city_caps_at_exactly_the_budget_per_city():
     assert len(urls) == 14
 
 
-def test_generate_niche_urls_per_city_includes_all_three_sources_when_budget_allows():
+def test_generate_niche_urls_per_city_covers_both_default_sources_when_budget_allows():
     name = next(iter(NICHE_SEARCH_TERMS))
     urls = generate_niche_urls_per_city(name, urls_per_city=50, cities=[("Austin", "TX")])
-    domains = {"yellowpages.com": False, "yelp.com": False, "thumbtack.com": False}
+    domains = {"yellowpages.com": False, "yelp.com": False}
     for u in urls:
         for d in domains:
             if d in u:
                 domains[d] = True
     assert all(domains.values()), domains
-
-
-def test_generate_niche_urls_per_city_thumbtack_still_capped_at_one_per_city():
-    """Thumbtack's page has no known pagination (a fixed "Top 10" list -
-    see THUMBTACK_RESULTS_PER_PAGE) - even a large per-city budget must
-    not invent extra thumbtack URLs that don't exist."""
-    name = next(iter(NICHE_SEARCH_TERMS))
-    urls = generate_niche_urls_per_city(name, urls_per_city=500, cities=[("Austin", "TX")])
-    thumbtack_urls = [u for u in urls if "thumbtack.com" in u]
-    assert len(thumbtack_urls) == 1
 
 
 def test_generate_niche_urls_per_city_single_source_gets_the_whole_budget():
