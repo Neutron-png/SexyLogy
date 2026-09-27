@@ -55,7 +55,7 @@ class ProjectsScreen(QWidget):
         self.list_widget.clear()
         projects = self.db.list_projects()
         if not projects:
-            self.list_widget.addItem("No scraping projects yet. Create your first one from New Scrape.")
+            self.list_widget.addItem("No scraping projects yet. Create your first one from New Campaign.")
             return
         for p in projects:
             last_run = "never" if not p["last_run_at"] else "ran"
@@ -91,7 +91,7 @@ class ProjectsScreen(QWidget):
         pid = self._selected_id()
         if not pid:
             return
-        if QMessageBox.question(self, "Delete project", "متأكد إنك عايز تحذف المشروع ده؟") == QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, "Delete project", "Delete this project?") == QMessageBox.StandardButton.Yes:
             self.db.delete_project(pid)
             self.refresh()
 

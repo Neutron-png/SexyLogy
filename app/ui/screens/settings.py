@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.storage.db import Database
-from app.core.engine import scrapling_adapter as engine
+from app.core.engine import fetch_engine as engine
 from app.core.exports.exporter import extra_fields_from_settings
 
 
@@ -42,7 +42,7 @@ class SettingsScreen(QWidget):
         theme.addItems(["Dark"])
         theme.setEnabled(False)
         language = QComboBox()
-        language.addItems(["English", "العربية"])
+        language.addItems(["English", "Arabic"])
         export_folder = QLineEdit(self.db.get_setting("default_export_folder", str(Path.home())))
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(lambda: self._pick_folder(export_folder))
@@ -106,11 +106,10 @@ class SettingsScreen(QWidget):
         w = QWidget()
         layout = QVBoxLayout(w)
         note = QLabel(
-            "أي حقل إجباري (required) في أودو بتاعك مش موجود في القالب القياسي - زي "
-            "Channel أو Source أو Sales Team - ضيفه هنا: اسم العمود زي ما هو مكتوب في "
-            "رسالة الخطأ بتاعة أودو (مثلاً 'Missing required value for the field Channel')، "
-            "والقيمة الثابتة اللي المفروض تتحط لكل ليد. لو الليد نفسه عنده حقل بنفس "
-            "الاسم من الأصل (من البيانات اللي اتجمعت)، القيمة بتاعته هي اللي بتتاخد."
+            "Any required field your Odoo needs that isn't in the standard template — like Channel, "
+            "Source or Sales Team — add it here: the column name exactly as it appears in Odoo's error "
+            "(e.g. 'Missing required value for the field Channel'), and the fixed value to set for "
+            "every lead. If the lead itself carries a field with that name, its own value wins."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #8B95A7; font-size: 11px;")
@@ -180,12 +179,12 @@ class SettingsScreen(QWidget):
     def _browser_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
-        status = QLabel("Checking Scrapling / browser status...")
+        status = QLabel("Checking the fetch engine / browser status...")
         layout.addWidget(status)
-        if engine.SCRAPLING_AVAILABLE:
-            status.setText("✓ Scrapling is installed and importable.")
+        if engine.ENGINE_AVAILABLE:
+            status.setText("✓ the fetch engine is installed and importable.")
         else:
-            status.setText(f"✗ Scrapling is not available: {engine.SCRAPLING_IMPORT_ERROR}")
+            status.setText(f"✗ the fetch engine is not available: {engine.ENGINE_IMPORT_ERROR}")
         reinstall_btn = QPushButton("Reinstall Browser Dependencies (scrapling install)")
         reinstall_btn.clicked.connect(self._reinstall_hint)
         layout.addWidget(reinstall_btn)
@@ -225,12 +224,12 @@ class SettingsScreen(QWidget):
     def _reinstall_hint(self):
         QMessageBox.information(
             self, "Browser dependencies",
-            "LOGY لا يشغّل أوامر تثبيت من جوه الواجهة تلقائيًا. "
-            "افتح الطرفية وشغّل:\n\npip install scrapling\nscrapling install",
+            "LOGY never runs install commands from the UI automatically. "
+            "Open a terminal and run:\n\npip install scrapling\nscrapling install",
         )
 
     def _clear_cache(self):
         cache_dir = Path(self.db.path).resolve().parent / "cache"
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
-        QMessageBox.information(self, "Cache", "تم مسح الكاش.")
+        QMessageBox.information(self, "Cache", "Cache cleared.")
