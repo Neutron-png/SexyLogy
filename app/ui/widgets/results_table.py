@@ -11,11 +11,77 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt
+from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtWidgets import QStyledItemDelegate
 
 from app.core.storage.db import Database
 
 PAGE_SIZE = 200
+
+
+def quality_pill(value) -> tuple[str, str, str] | None:
+    """(short label, kind) for the concept's Quality column. The stored
+    digital_label strings are long ("Weak site - strong lead"); pills show
+    the short concept wording so they never need clipping. Returns None
+    for anything that isn't a digital_label/quality value."""
+    s = str(value)
+    if s.startswith("No website"):
+        return "No website", "bad"
+    if s.startswith("Weak site"):
+        return "Strong lead", "ok"
+    if s.startswith("Some gaps"):
+        return "Worth a look", "warn"
+    if s.startswith("Strong site"):
+        return "Low priority", "dim"
+    return None
+
+
+class QualityPillDelegate(QStyledItemDelegate):
+    """Draws digital_label values as the concept's rounded status pills,
+    elided inside the cell — never overflowing into the next column."""
+
+    def paint(self, p: QPainter, opt, index):
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        pill = quality_pill(text) if text else None
+        if not pill:
+            super().paint(p, opt, index)
+            return
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        from app.ui import theme as ui_theme
+        tk = ui_theme.tokens()
+        kind = pill[1]
+        if kind == "ok":
+            bg, fg, ln = QColor(tk["SUCCESS"]), QColor(tk["SUCCESS"]), QColor(tk["OK_LINE"])
+        elif kind == "warn":
+            bg, fg, ln = QColor(tk["WARNING"]), QColor(tk["WARNING"]), QColor(tk["WARNING"])
+        elif kind == "bad":
+            bg, fg, ln = QColor(tk["DANGER"]), QColor(tk["BAD_TEXT"]), QColor(tk["DANGER"])
+        else:  # dim — tokens hold CSS rgba() strings QColor can't parse, build manually
+            dark = ui_theme.current() == "dark"
+            bg = QColor(255, 255, 255, 28) if dark else QColor(20, 26, 46, 26)
+            fg = QColor("#8FA3C0") if dark else QColor("#5A6073")
+            ln = QColor(255, 255, 255, 30) if dark else QColor(20, 26, 46, 30)
+        bg.setAlphaF(0.12 if kind != "dim" else bg.alphaF())
+
+        r = opt.rect
+        f = p.font(); f.setPointSizeF(8.0); f.setBold(True); p.setFont(f)
+        avail = max(0, r.width() - 16)
+        label = p.fontMetrics().elidedText(pill[0], Qt.TextElideMode.ElideRight, avail)
+        w = min(avail + 16, r.width() - 4)
+        h = 20
+        y = r.y() + (r.height() - h) // 2
+        x = r.x() + 4
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(QRectF(x, y, w, h), h / 2.0, h / 2.0)
+        p.setPen(QPen(ln, 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(x + 0.5, y + 0.5, w - 1, h - 1), (h - 1) / 2.0, (h - 1) / 2.0)
+        p.setPen(fg)
+        p.drawText(QRectF(x, y, w, h), Qt.AlignmentFlag.AlignCenter, label)
+        p.restore()
 
 
 class ResultsTableModel(QAbstractTableModel):
@@ -44,7 +110,28 @@ class ResultsTableModel(QAbstractTableModel):
         self._columns = cols or ["value"]
 
     def append_live_result(self):
-        """Called after a new result is persisted mid-job; keeps row count in sync."""
+        """Called after a new result is persisted mid-job. Fast path: when
+        the whole result set is already loaded and columns are stable, an
+        O(1) row insert - the old full beginResetModel() per lead made the
+        table flash and re-query on every single saved lead (audit M)."""
+        new_total = self.db.count_results(self.job_id)
+        if (new_total == self._total + 1 and self._columns
+                and len(self._loaded_rows) == self._total):
+            rows = self.db.page_results(self.job_id, new_total - 1, 1)
+            if rows:
+                import json
+                data = json.loads(rows[0]["data_json"])
+                data["_source_url"] = rows[0]["source_url"]
+                data["_scraped_at"] = rows[0]["scraped_at"]
+                data["_id"] = rows[0]["id"]
+                new_cols = [k for k in data.keys() if k not in self._columns]
+                if not new_cols:
+                    self.beginInsertRows(QModelIndex(), self._total, self._total)
+                    self._loaded_rows.append(data)
+                    self._total = new_total
+                    self.endInsertRows()
+                    return
+        # columns changed / gap: full refresh is the only correct move
         self.beginResetModel()
         self.refresh_columns_and_count()
         self._loaded_rows = []
