@@ -1,15 +1,27 @@
 from app.core.engine.qualifier import qualify_html
 
-STRONG_SITE = """
+STRONG_COPY = (
+    "Acme Pool Builders designs custom pools for Austin families. Our team plans every project "
+    "around the homeowner's property, budget, and schedule. Designers coordinate permits, excavation, "
+    "construction, finishing, and long-term maintenance. Customers can compare pool shapes, materials, "
+    "lighting, and energy-efficient equipment before booking a consultation. Project galleries explain "
+    "the process and show completed work throughout the Austin area. Every estimate outlines scope, "
+    "timing, and care recommendations so families know what to expect. "
+) * 4
+
+STRONG_SITE = f"""
 <!doctype html>
 <html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Acme Pool Builders - Custom Pools in Austin, TX</title>
 <meta name="description" content="Austin's top-rated custom pool builder. Get a free quote today.">
-<script type="application/ld+json">{"@type": "LocalBusiness", "name": "Acme Pool Builders"}</script>
+<meta property="og:title" content="Acme Pool Builders">
+<meta property="og:description" content="Custom pools designed and built in Austin, Texas.">
+<link rel="canonical" href="https://acmepoolbuilders.example/">
+<script type="application/ld+json">{{"@type": "LocalBusiness", "name": "Acme Pool Builders"}}</script>
 <script async src="https://www.googletagmanager.com/gtag/js"></script>
-</head><body><h1>Custom Pools</h1></body></html>
+</head><body><h1>Custom Pools</h1><p>{STRONG_COPY}</p></body></html>
 """
 
 WEAK_SITE = """
@@ -36,7 +48,7 @@ def test_no_website_is_highest_priority():
 def test_strong_modern_site_scores_low():
     result = qualify_html(STRONG_SITE)
     assert result.has_website is True
-    assert result.score <= 15  # only missing an explicit https:// literal in this fixture's markup
+    assert result.score <= 15
     assert "Strong site" in result.label or "Some gaps" in result.label
 
 
