@@ -2,14 +2,14 @@
 Applies a list of ExtractionField definitions to a parsed page and returns
 a plain dict (or a list of dicts, when a field is repeated/"multiple").
 
-This module is intentionally decoupled from Scrapling: it only calls
+This module is intentionally decoupled from the fetch engine: it only calls
 `.css(selector)` / `.xpath(selector)` on whatever `page` object it is
 given, and expects elements back that expose `.get()`, `.getall()` and
-`.attrib` - exactly the surface Scrapling's `Selector`/`Adaptor` objects
-expose (https://github.com/D4Vinci/Scrapling -> parser.Selector).
+`.attrib` - exactly the surface the engine's `Selector`/`Adaptor` objects
+expose (https://github.com/D4Vinci/the fetch engine -> parser.Selector).
 
 That decoupling is what makes this file unit-testable without installing
-Scrapling or touching the network (see tests/test_extractor.py, which
+the fetch engine or touching the network (see tests/test_extractor.py, which
 feeds it a minimal lxml-backed stand-in with the same interface).
 """
 from __future__ import annotations
@@ -53,10 +53,10 @@ def _element_text(element: Any) -> Any:
     `<a class="business-name"><span>Holy Drilling</span></a>`, text one
     level below the matched element.
 
-    `element.get()` alone does NOT do this: Scrapling's Selector API
+    `element.get()` alone does NOT do this: the engine's Selector API
     follows the same convention as scrapy/parsel, where css()/xpath()
     return ELEMENT matches, and .get() on an element match returns that
-    element's OUTER HTML, not its text (Scrapling's own quickstart docs
+    element's OUTER HTML, not its text (the engine's own quickstart docs
     extract text via `page.css('.quote .text::text').getall()` - the
     `::text` is required). Calling plain .get() here was a real, shipped
     bug: every text field (business_name, phone, address, city) was
@@ -65,7 +65,7 @@ def _element_text(element: Any) -> Any:
     exported CSV.
 
     Fix: query `::text` scoped to the already-matched element, which
-    (per Scrapling/parsel semantics) returns every descendant text node
+    (per the fetch engine/parsel semantics) returns every descendant text node
     regardless of nesting, and join them. If that query isn't supported
     by whatever selector engine is behind `element` (e.g. the plain
     bs4-backed test double), fall back to stripping tags off the raw
@@ -128,11 +128,19 @@ def extract_fields(page: Any, fields: list[ExtractionField]) -> dict[str, Any]:
     return record
 
 
-def extract_records(page: Any, container_selector: str, container_type: str, fields: list[ExtractionField]) -> list[dict[str, Any]]:
+def extract_records(page: Any, container_selector: str, container_type: str,
+                    fields: list[ExtractionField], *,
+                    auto_save: bool = False, adaptive: bool = False) -> list[dict[str, Any]]:
     """
     For listing pages (e.g. search results / directory pages): select a
     repeating container element per record, then run each field relative
     to that container. Used by the Field Builder's "repeat over" option.
+
+    `auto_save`/`adaptive` are the engine's official Adaptive-Scraping knobs
+    passed straight through: the first successful page per source saves the
+    element's fingerprint (auto_save=True), and when a page later returns
+    zero containers the caller retries with adaptive=True so the fetch engine
+    relocates the element even after the site changed its markup.
 
     Skips a container that only produced a single non-empty field. Real
     directory sites sometimes render a second, near-empty element that
@@ -146,7 +154,22 @@ def extract_records(page: Any, container_selector: str, container_type: str, fie
     exports/qualification with junk rows - a real record from a listing
     page should have at least a name AND one more piece of contact info.
     """
-    containers = page.xpath(container_selector) if container_type == "xpath" else page.css(container_selector)
+    def _select() -> list:
+        if container_type == "xpath":
+            if adaptive or auto_save:
+                try:
+                    return page.xpath(container_selector, adaptive=adaptive, auto_save=auto_save)
+                except TypeError:
+                    pass  # page object without adaptive support
+            return page.xpath(container_selector)
+        if adaptive or auto_save:
+            try:
+                return page.css(container_selector, adaptive=adaptive, auto_save=auto_save)
+            except TypeError:
+                pass
+        return page.css(container_selector)
+
+    containers = _select()
     records = []
     for container in containers:
         record = extract_fields(container, fields)

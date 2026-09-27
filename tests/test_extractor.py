@@ -82,7 +82,7 @@ def test_bad_css_selector_raises_extraction_error():
 # matched element's raw outer HTML (e.g.
 # '<a class="business-name"...><span>Holy Drilling</span></a>') instead
 # of the clean visible text - visible directly in an exported CSV a user
-# sent back. Scrapling's Selector API follows scrapy/parsel conventions
+# sent back. the engine's Selector API follows scrapy/parsel conventions
 # where .get() on an element match returns outer HTML, not text; text
 # needs an explicit '::text' query, which is what extract_fields() now
 # does under the hood (see extractor._element_text()).
