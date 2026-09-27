@@ -6,6 +6,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton
 
 from app.core.storage.db import Database
+from app.ui.widgets.buttons import PrimaryButton
 
 
 class TemplatesScreen(QWidget):
@@ -29,8 +30,7 @@ class TemplatesScreen(QWidget):
         layout.addWidget(self.list_widget, 1)
 
         row = QHBoxLayout()
-        self.use_btn = QPushButton("Use in New Scrape")
-        self.use_btn.setObjectName("primaryButton")
+        self.use_btn = PrimaryButton("Use in New Campaign")
         self.use_btn.clicked.connect(self._use_selected)
         row.addWidget(self.use_btn)
         row.addStretch(1)
