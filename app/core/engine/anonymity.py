@@ -10,9 +10,9 @@ What actually works against websites (and what doesn't):
 - MAC address: a layer-2 identifier that never leaves the local network -
   the first router strips it. Websites CANNOT see it, so rotating it does
   nothing for web anonymity. Deliberately not implemented; don't fake it.
-- Browser fingerprint (UA/TLS/WebRTC/canvas...): handled by Scrapling's
+- Browser fingerprint (UA/TLS/WebRTC/canvas...): handled by the engine's
   fetchers themselves (chrome impersonation, stealth Chromium, block_webrtc
-  when tunneling through Tor - see scrapling_adapter.py).
+  when tunneling through Tor - see fetch_engine.py).
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import threading
 from typing import Optional
 
 # Playwright-based browsers (Dynamic/Stealth) only accept http/https/socks4/
-# socks5 proxy schemes - "socks5h" raises ValueError in Scrapling's
+# socks5 proxy schemes - "socks5h" raises ValueError in the engine's
 # construct_proxy_dict(). curl-cffi (FAST_HTTP) on the other hand supports
 # socks5h natively, and the trailing "h" matters there: it forces DNS
 # resolution through the proxy, so the machine's own DNS resolver never
@@ -80,7 +80,7 @@ def looks_like_block(reason: str) -> bool:
 
 
 def tor_socks_url(socks_port: int, for_http: bool) -> str:
-    """The proxy string to hand Scrapling for tunneling through Tor."""
+    """The proxy string to hand the fetch engine for tunneling through Tor."""
     template = TOR_SOCKS_HTTP if for_http else TOR_SOCKS_BROWSER
     return template.format(host="127.0.0.1", port=int(socks_port))
 

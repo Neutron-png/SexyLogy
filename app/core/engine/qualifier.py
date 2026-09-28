@@ -12,7 +12,7 @@ about that boundary matters: a "digital weakness score" that pretended to
 know a business's ad spend would be exactly the kind of fake
 functionality the project spec forbids.
 
-Pure Python, no Qt/Scrapling import -> unit-testable (see
+Pure Python, no Qt/the fetch engine import -> unit-testable (see
 tests/test_qualifier.py) with a plain HTML string.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _strip_tags(html: str) -> str:
     """Rough visible-text extraction for the thin-content check below -
     drops <script>/<style> blocks entirely (their contents aren't visible
     text) then strips remaining tags. Not meant to be a full HTML-to-text
-    pipeline (see scrapling_adapter.html_to_text() for that); just enough
+    pipeline (see fetch_engine.html_to_text() for that); just enough
     to get an honest word count for a single fetched page."""
     return _TAG_RE.sub(" ", html)
 
