@@ -1,15 +1,15 @@
 """
-Minimal stand-in for Scrapling's Selector/Adaptor, built on BeautifulSoup,
+Minimal stand-in for the engine's Selector/Adaptor, built on BeautifulSoup,
 used ONLY in tests so app/core/engine/extractor.py can be verified without
-installing Scrapling. It implements the exact slice of the interface
+installing the fetch engine. It implements the exact slice of the interface
 extractor.py relies on: .css(selector) / .xpath(selector) returning a
 list of elements, each exposing .get() (text), .attrib (dict-like) and
-.html (outer HTML) - mirroring Scrapling's real Selector API
-(https://github.com/D4Vinci/Scrapling, parser.Selector).
+.html (outer HTML) - mirroring the engine's real Selector API
+(https://github.com/D4Vinci/the fetch engine, parser.Selector).
 
 XPath support here is intentionally tiny (only what the tests need) since
 BeautifulSoup has no native XPath engine; production XPath goes through
-Scrapling's real Selector, not this stand-in.
+the engine's real Selector, not this stand-in.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 
 
 class _FakeTextNode:
-    """A bare text node - what a real Scrapling/parsel `::text` match
+    """A bare text node - what a real the fetch engine/parsel `::text` match
     returns (as opposed to FakeElement, which represents a tag match).
     Only .get() is meaningful on it, mirroring the real API."""
 
@@ -33,12 +33,12 @@ class FakeElement:
         self._node = node
 
     def css(self, selector: str) -> "FakeElementList":
-        """Scrapling elements support .css()/.xpath() scoped to themselves
+        """the fetch engine elements support .css()/.xpath() scoped to themselves
         (see README 'Advanced Navigation': `first_quote.css('.text::text')`).
         bs4's Tag.select() is descendant-scoped the same way.
 
         `::text` (with nothing before it) is handled specially here, the
-        same way real Scrapling/parsel treat it when scoped from an
+        same way real the fetch engine/parsel treat it when scoped from an
         already-matched element: it returns every descendant text node,
         at any depth - not just direct children. That's exactly the
         pattern app/core/engine/extractor.py's _element_text() relies on
@@ -58,7 +58,7 @@ class FakeElement:
         raise NotImplementedError("scoped xpath not needed by these tests")
 
     def get(self):
-        """Mirrors real Scrapling/parsel: .get() on an ELEMENT match
+        """Mirrors real the fetch engine/parsel: .get() on an ELEMENT match
         returns that element's outer HTML, not its text - callers that
         want text must query '::text' (see .css() above). Do NOT
         "helpfully" return get_text() here; that was the whole point of
@@ -96,7 +96,7 @@ class FakeSelector:
 
     def xpath(self, selector: str) -> FakeElementList:
         # Tiny subset: "//tag[@class='x']" and "//tag" - enough for the
-        # container-repeat test. Real XPath goes through Scrapling in prod.
+        # container-repeat test. Real XPath goes through the fetch engine in prod.
         import re
         m = re.match(r"^//(\w+)(?:\[@class=['\"]([\w-]+)['\"]\])?$", selector.strip())
         if not m:
