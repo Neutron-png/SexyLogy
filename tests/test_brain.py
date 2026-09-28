@@ -15,9 +15,11 @@ _TABLE_COLS = {
     "domain_stats": ["host", "delay_ms", "consecutive_blocks", "log_odds", "disabled_until"],
     "sticky_identities": ["host", "identity_key"],
     "response_cache": ["url", "etag", "last_modified", "body", "fetched_at"],
+    "identity_domain_stats": ["key", "host", "successes", "blocks"],
 }
 _KEY_COL = {"identity_stats": "key", "domain_stats": "host",
-            "sticky_identities": "host", "response_cache": "url"}
+            "sticky_identities": "host", "response_cache": "url",
+            "identity_domain_stats": "key"}
 
 
 class _FakeCursor:
