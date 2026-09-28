@@ -5,9 +5,7 @@ Redesigned into two tabs:
   - "Job Runs"      the original per-job history (unchanged behavior).
   - "Leads History" NEW - every lead ever generated, across every job and
                     project, de-duplicated by app/core/engine/dedupe.py's
-                    fingerprint. This is the actual answer to "عايز اعمل
-                    هيستوري لليدز اللي طلعت مسبقا متتكررش كل ما نجينيريت
-                    ليدز": app/core/job_manager.py already skips re-saving a
+                    fingerprint. (da howa el so2al: mat3awedsh leeds 2adema) - app/core/job_manager.py already skips re-saving a
                     lead whose fingerprint is in here (see its main loop),
                     this tab is where that memory becomes visible/manageable
                     - searchable, and clearable via "Clear Leads History"
@@ -19,6 +17,7 @@ from __future__ import annotations
 import datetime
 import json
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QMessageBox,
@@ -43,6 +42,8 @@ def _lead_field(data: dict, *keys: str) -> str:
 
 
 class HistoryScreen(QWidget):
+    resume_requested = Signal(int)   # job_id of an INTERRUPTED job to resume
+
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
@@ -55,6 +56,15 @@ class HistoryScreen(QWidget):
         title.setObjectName("pageTitle")
         header_row.addWidget(title)
         header_row.addStretch(1)
+        self.resume_btn = QPushButton("Resume interrupted job")
+        self.resume_btn.setObjectName("primaryButton")
+        self.resume_btn.setVisible(False)
+        self.resume_btn.setToolTip(
+            "أول ما التطبيق يتقفل ومهمة شغالة، المهمة بتتعلم INTERRUPTED مع كل الروابط "
+            "اللي لسه متجلبش. الزرار ده بيكمّل من نفس النقطة - اللي اتجاب قبل كده مش بيتجاب تاني."
+        )
+        self.resume_btn.clicked.connect(self._resume_selected)
+        header_row.addWidget(self.resume_btn)
         layout.addLayout(header_row)
 
         self.tabs = QTabWidget()
@@ -64,6 +74,34 @@ class HistoryScreen(QWidget):
         self.tabs.addTab(self._build_leads_tab(), "Leads History")
 
         self.refresh()
+
+    def _selected_job(self) -> dict | None:
+        row = self.jobs_table.currentRow()
+        if row < 0:
+            return None
+        item = self.jobs_table.item(row, 0)
+        if not item:
+            return None
+        try:
+            job_id = int(item.text().lstrip("#"))
+        except ValueError:
+            return None
+        return self.db.get_job(job_id)
+
+    def _resume_selected(self):
+        job = self._selected_job()
+        if not job:
+            return
+        if job["status"] != "interrupted":
+            QMessageBox.information(self, "Resume",
+                                    "الاستئناف متاح للمهام اللي حالتها INTERRUPTED بس.")
+            return
+        pending = self.db.queue_pending(job["id"])
+        if not pending:
+            QMessageBox.information(self, "Resume",
+                                    "مفيش روابط متبقية في المهمة دي - كل روابطها خلصت.")
+            return
+        self.resume_requested.emit(job["id"])
 
     # ------------------------------------------------------------------
     # Job Runs tab (unchanged behavior, just moved into its own tab)
@@ -79,8 +117,13 @@ class HistoryScreen(QWidget):
         self.jobs_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.jobs_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.jobs_table.setAlternatingRowColors(True)
+        self.jobs_table.itemSelectionChanged.connect(self._sync_resume_btn)
         layout.addWidget(self.jobs_table, 1)
         return w
+
+    def _sync_resume_btn(self):
+        job = self._selected_job()
+        self.resume_btn.setVisible(bool(job and job["status"] == "interrupted"))
 
     # ------------------------------------------------------------------
     # Leads History tab (new)
@@ -134,8 +177,8 @@ class HistoryScreen(QWidget):
     def _clear_leads_history(self):
         reply = QMessageBox.question(
             self, "Clear Leads History",
-            "متأكد إنك عايز تمسح هيستوري الليدز كله؟\n"
-            "بعد المسح، أي ليد طلع قبل كده ممكن يظهر تاني في سكرابنج جديد.",
+            "Delete the entire leads history?\n"
+            "After clearing, any lead seen before may appear again in new campaigns.",
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.db.clear_lead_history()
