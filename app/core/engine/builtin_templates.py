@@ -71,7 +71,7 @@ below.
 import json
 from urllib.parse import quote
 
-from app.core.models import ExtractionField, ExtractionType
+from app.core.models import ExtractionField, ExtractionType, FetcherMode
 
 # ---------------------------------------------------------------------
 # yellowpages.com - captured live from search-results markup. One
@@ -116,7 +116,7 @@ _YELP_LEAD_FIELDS = [
 # record from the search-results page, if it has a non-empty
 # `link_field`, fetch that URL and merge in whatever `regex_fields`
 # match against the fetched page's visible text (see html_to_text() in
-# scrapling_adapter.py). Regex, not a CSS selector, on purpose: Yelp's
+# fetch_engine.py). Regex, not a CSS selector, on purpose: Yelp's
 # business-page phone number sits in a bare hashed class
 # (`<p class="y-css-1baza3a">`) with no stable semantic hook at all
 # (unlike "businessName", there's no "phone"-ish substring to key off
@@ -224,7 +224,14 @@ _THUMBTACK_LEAD_FIELDS = [
 THUMBTACK_CONTAINER = _THUMBTACK_CONTAINER
 THUMBTACK_LEAD_FIELDS = _THUMBTACK_LEAD_FIELDS
 
-THUMBTACK_RESULTS_PER_PAGE = 10  # "The 10 Best X in <City>" - thumbtack's own page title pattern
+# As of 2026-09-26 thumbtack serves the listing page behind an AWS WAF
+# JS challenge AND server-renders only the TOP pro card per city page
+# (the ItemList ld+json carries 1 item; the rest of the "10 best" grid
+# hydrates behind a gated client-side flow that no fetch engine reaches).
+# LOGY's WAF rescue (job_manager's stealth re-fetch with wait_selector)
+# gets past the challenge and reliably extracts that 1 lead per city URL
+# - honest expectation: ~1 thumbtack lead per city, not 10.
+THUMBTACK_RESULTS_PER_PAGE = 1
 
 
 def _thumbtack_slug(text: str) -> str:
@@ -524,9 +531,11 @@ SOURCE_PROFILES: list[dict] = [
     {"name": "yellowpages", "domain": "yellowpages.com", "container": _YP_CONTAINER,
      "fields": _YP_LEAD_FIELDS, "detail_config": None, "verified": True},
     {"name": "yelp", "domain": "yelp.com", "container": _YELP_CONTAINER,
-     "fields": _YELP_LEAD_FIELDS, "detail_config": _YELP_DETAIL_CONFIG, "verified": True},
+     "fields": _YELP_LEAD_FIELDS, "detail_config": _YELP_DETAIL_CONFIG, "verified": True,
+     "fetcher_mode": FetcherMode.STEALTH_BROWSER},
     {"name": "thumbtack", "domain": "thumbtack.com", "container": _THUMBTACK_CONTAINER,
-     "fields": _THUMBTACK_LEAD_FIELDS, "detail_config": None, "verified": True},
+     "fields": _THUMBTACK_LEAD_FIELDS, "detail_config": None, "verified": True,
+     "fetcher_mode": FetcherMode.STEALTH_BROWSER},
 ]
 
 
@@ -571,40 +580,35 @@ def generate_niche_urls_all_sources(
     niche_name: str, target_results: int, max_urls: int = MAX_URLS_ALL_CITIES * 2,
     cities: list[tuple[str, str]] | None = None,
 ) -> list[str]:
-    """Combined yellowpages.com + Yelp + thumbtack.com URL list for one
-    niche, sized so the three sources split target_results roughly
-    evenly between them (each generator already accounts for its own
-    page size - RESULTS_PER_PAGE / YELP_RESULTS_PER_PAGE /
-    THUMBTACK_RESULTS_PER_PAGE - so this just calls all three with a
-    third of the target and concatenates). The result mixes all three
-    domains in one flat list - that's the point (see SOURCE_PROFILES
-    above): a single job whose start_urls list is exactly this can
-    extract every URL correctly in one run instead of needing three
-    separate runs merged by hand afterward. This is what Quick Start's
-    per-niche picker calls automatically now (no more separate
-    "yellowpages-only" / "Yelp-only" / "All Sources" choices to make per
-    niche - see new_scrape.py's niche_combo). `cities` (see
+    """Combined yellowpages.com + Yelp URL list for one niche, sized so
+    the two sources split target_results roughly evenly (each generator
+    already accounts for its own page size - RESULTS_PER_PAGE /
+    YELP_RESULTS_PER_PAGE - so this just calls both with half the target
+    and concatenates). The result mixes both domains in one flat list -
+    that's the point (see SOURCE_PROFILES above): a single job whose
+    start_urls list is exactly this can extract every URL correctly in
+    one run instead of needing separate runs merged by hand afterward.
+    This is what Quick Start's per-niche picker calls automatically now
+    (no more separate "yellowpages-only" / "Yelp-only" choices to make
+    per niche - see new_scrape.py's niche_combo). `cities` (see
     resolve_cities()) is forwarded unchanged to every sub-call so a city
-    restriction applies to all three sources at once. thumbtack's own
-    selectors are still unverified (see the module note above on
-    _THUMBTACK_CONTAINER) - its URLs are included here for when they're
-    filled in, but until then its pages will fetch fine and simply
-    extract 0 records, same as any source with an empty container.
-    A source added via the Sources card (other than the three built-ins)
-    doesn't have a per-niche URL generator of its own - it only ever
-    comes into a combined run via its own start_urls the user pastes in,
-    since URL PATTERNS differ per site in a way generate_niche_urls()
-    can't guess for an arbitrary new domain."""
-    third = max(1, target_results // 3)
-    yp_max = max(1, max_urls // 3)
-    yp_urls = generate_niche_urls(niche_name, third, max_urls=yp_max, cities=cities)
-    remaining = max(1, max_urls - len(yp_urls))
-    yelp_max = max(1, remaining // 2)
-    yelp_urls = generate_niche_urls_yelp(niche_name, third, max_urls=yelp_max, cities=cities)
-    thumbtack_urls = generate_niche_urls_thumbtack(
-        niche_name, third, max_urls=max(1, max_urls - len(yp_urls) - len(yelp_urls)), cities=cities,
-    )
-    return yp_urls + yelp_urls + thumbtack_urls
+    restriction applies to both sources at once.
+
+    THUMBTACK IS OPT-IN as of 2026-09-26 and NOT included here: AWS WAF
+    challenge (stealth-only, 15-150s per URL) + at most 1 server-rendered
+    lead per city page made its cost/lead the worst in the mix by far.
+    Call generate_niche_urls_thumbtack() explicitly and concatenate if a
+    run wants it anyway. A source added via the Sources card (other than
+    the built-ins) doesn't have a per-niche URL generator of its own -
+    it only ever comes into a combined run via its own start_urls the
+    user pastes in, since URL PATTERNS differ per site in a way
+    generate_niche_urls() can't guess for an arbitrary new domain."""
+    half = max(1, target_results // 2)
+    yp_max = max(1, max_urls // 2)
+    yp_urls = generate_niche_urls(niche_name, half, max_urls=yp_max, cities=cities)
+    yelp_max = max(1, max_urls - len(yp_urls))
+    yelp_urls = generate_niche_urls_yelp(niche_name, half, max_urls=yelp_max, cities=cities)
+    return yp_urls + yelp_urls
 
 
 # "عايز يجمع 2000 لينك لكل مدينة (كل ال3 مصادر مع بعض)" - the ORIGINAL
@@ -637,21 +641,29 @@ def generate_niche_urls_per_city(
     niche_name: str, urls_per_city: int = 2000,
     cities: list[tuple[str, str]] | None = None,
     max_pages_per_source: int = DEEP_MAX_PAGES_PER_SOURCE,
-    sources: tuple[str, ...] = ("thumbtack", "yellowpages", "yelp"),
+    sources: tuple[str, ...] = ("yellowpages", "yelp"),
 ) -> list[str]:
     """Builds up to `urls_per_city` URLs for EACH selected city
     independently (see the module note above for how this differs from
     generate_niche_urls_all_sources()'s shared/global budget), combining
     the sources listed in `sources` (any of "thumbtack" / "yellowpages" /
-    "yelp", default all three): thumbtack.com's one city+niche page (if
-    included), then yellowpages.com and yelp.com pages alternating (YP
-    page 1, Yelp page 1, YP page 2, Yelp page 2, ...) until either
-    `urls_per_city` is reached for that city or every included source has
-    been paged `max_pages_per_source` deep. Restricting `sources` to a
-    single one (e.g. `("yellowpages",)`) gives that ONE source the WHOLE
-    `urls_per_city` budget per city instead of sharing it with the
-    others - what new_scrape.py's single-source "Load ... Search Links"
-    buttons use, versus Quick Start's default all-three call.
+    "yelp", default yellowpages + yelp): yellowpages.com and yelp.com
+    pages alternating (YP page 1, Yelp page 1, YP page 2, Yelp page 2,
+    ...) until either `urls_per_city` is reached for that city or every
+    included source has been paged `max_pages_per_source` deep.
+    Restricting `sources` to a single one (e.g. `("yellowpages",)`) gives
+    that ONE source the WHOLE `urls_per_city` budget per city instead of
+    sharing it with the others - what new_scrape.py's single-source
+    "Load ... Search Links" buttons use, versus Quick Start's default
+    call.
+
+    THUMBTACK IS OPT-IN as of 2026-09-26, and deliberately NOT in the
+    default mix: it sits behind an AWS WAF challenge (stealth-browser
+    fetch, 15-150s per URL) and now server-renders at most 1 lead per
+    city page (see THUMBTACK_RESULTS_PER_PAGE). One thumbtack URL per
+    city across a 100-city run can burn hours of stealth time for a
+    handful of leads. Pass `sources=("thumbtack", "yellowpages", "yelp")`
+    explicitly if you want it back.
 
     Cities are processed in `cities`/CITY_POOL order and concatenated -
     the result is NOT interleaved across cities (contrast
