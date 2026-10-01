@@ -18,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.engine import fetch_engine as engine
+from app.core.engine import anonymity
 from app.core.engine.fetch_engine import FetchError
 from app.core.job_manager import ScrapeJobWorker
 from app.core.models import FetcherMode, ScrapeOptions, TargetConfig
@@ -72,8 +73,10 @@ def test_blocked_host_urls_dropped_and_job_ends():
         urls = [f"https://www.yelp.com/search?p={i}" for i in range(6)]
         worker = _make_worker(Path(tmp), urls)
         worker._interruptible_sleep = lambda seconds: None  # no real waiting
-        with mock.patch.object(engine, "fetch_one", side_effect=_fake_fetch_403):
-            messages = _run_worker(worker)
+        # no Tor escape hatch on this machine -> pure drop-path regression
+        with mock.patch.object(anonymity, "tor_reachable", return_value=False):
+            with mock.patch.object(engine, "fetch_one", side_effect=_fake_fetch_403):
+                messages = _run_worker(worker)
 
     joined = "\n".join(messages)
     assert "محجوب" in joined
@@ -97,14 +100,109 @@ def test_parked_host_is_skipped_without_fetch():
         worker._prepare_proxy = lambda url: None
 
         fetch_calls: list[str] = []
-        with mock.patch.object(engine, "fetch_one",
-                               side_effect=lambda url, *a, **k: fetch_calls.append(url)
-                               or (_ for _ in ()).throw(FetchError(url, "HTTP 403"))):
-            messages = _run_worker(worker)
+        with mock.patch.object(anonymity, "tor_reachable", return_value=False):
+            with mock.patch.object(engine, "fetch_one",
+                                   side_effect=lambda url, *a, **k: fetch_calls.append(url)
+                                   or (_ for _ in ()).throw(FetchError(url, "HTTP 403"))):
+                messages = _run_worker(worker)
 
     assert len(fetch_calls) <= 1  # parked URLs never reach the fetcher
     assert any("تخطي" in m and "رابط متبقٍ" in m for m in messages)
     assert any("إنهاء المهمة مبكرا" in m for m in messages)
+
+
+def test_403_on_fast_lane_hands_host_to_stealth_browser():
+    """The yellowpages 403 session: the fast lane's HTTP 403 (the yellow
+    WARNING lines) used to end in a red error + a parked host + minutes of
+    30s defer cycles. Now the host is handed to scrapling's stealth
+    browser (which passes those walls) and its remaining URLs - including
+    the one that just got 403'd - go through the browser lane."""
+    with tempfile.TemporaryDirectory() as tmp:
+        urls = ["https://www.yellowpages.com/search?term=a&page=1",
+                "https://www.yellowpages.com/search?term=a&page=2"]
+        worker = _make_worker(Path(tmp), urls)
+        worker._interruptible_sleep = lambda seconds: None
+        worker._setup_brain = lambda: None
+        worker._brain = mock.MagicMock()
+        worker._brain.gate.return_value = True
+        worker._brain.delay_s.return_value = 0.0
+        worker._prepare_proxy = lambda url: None
+        worker.container = {"selector": "div.result", "type": "css"}
+        worker._base_container = worker.container
+
+        calls: list[tuple[str, FetcherMode]] = []
+
+        def fake_fetch(url, options, should_stop=None, cache=None, wait_selector=None, session=None):
+            if url.endswith("/robots.txt"):  # robots probe - not a job fetch
+                return mock.MagicMock(status=200, ok=True, page=_FakePage(REAL_HTML))
+            calls.append((url, options.fetcher_mode))
+            if options.fetcher_mode == FetcherMode.STEALTH_BROWSER:
+                return mock.MagicMock(status=200, ok=True, page=_FakePage(REAL_HTML))
+            raise FetchError(url, "HTTP 403")
+
+        try:
+            with mock.patch.object(engine, "fetch_one", side_effect=fake_fetch), \
+                 mock.patch("app.core.job_manager.extract_records",
+                            side_effect=lambda page, *a, **k:
+                                [{"business_name": "Dreemer"}] if page.html == REAL_HTML else []):
+                messages = _run_worker(worker)
+        finally:
+            worker.db.close()
+
+    modes = [m for _, m in calls]
+    # URL1: one fast 403 -> straight to stealth (no repeated fast retries);
+    # URL2: skips the fast lane entirely (host remembered straight-to-browser)
+    assert modes == [FetcherMode.FAST_HTTP, FetcherMode.STEALTH_BROWSER,
+                     FetcherMode.STEALTH_BROWSER], modes
+    joined = "\n".join(messages)
+    assert "متصفح stealth" in joined
+    assert joined.count("سجل تم استخراجه") == 2
+
+
+def test_parked_host_defer_no_longer_stalls_other_hosts():
+    """Old behavior: every deferral of a parked host slept 30s INLINE,
+    stalling the whole mixed queue behind it while producing nothing.
+    Now the parked URL requeues at the END of the queue, and the sleep
+    only happens when nothing else is fetchable (single-host park)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        urls = ["https://www.yellowpages.com/search?term=a",
+                "https://www.yelp.com/search?find_desc=a",
+                "https://www.yelp.com/search?find_desc=b"]
+        worker = _make_worker(Path(tmp), urls)
+        sleeps: list[float] = []
+        worker._interruptible_sleep = lambda seconds: sleeps.append(seconds)
+        worker._setup_brain = lambda: None
+        worker._brain = mock.MagicMock()
+        worker._brain.gate.side_effect = lambda u: "yellowpages" not in u
+        worker._brain.delay_s.return_value = 0.0
+        worker._prepare_proxy = lambda url: None
+        # stealth already had its one shot for this host -> the gate branch
+        # is the genuine defer path (escalation impossible)
+        worker._stealth_escalated_hosts.add("www.yellowpages.com")
+
+        fetched: list[tuple[str, int]] = []
+        big = "<html><head><title>ok</title></head><body>" + "x" * 9000 + "</body></html>"
+
+        def fake_fetch(url, options, should_stop=None, cache=None, wait_selector=None, session=None):
+            if url.endswith("/robots.txt"):  # robots probe - not a job fetch
+                return mock.MagicMock(status=200, ok=True, page=_FakePage(REAL_HTML))
+            fetched.append((url, sum(1 for s in sleeps if s >= 30)))
+            return mock.MagicMock(status=200, ok=True, page=_FakePage(big))
+
+        with mock.patch.object(anonymity, "tor_reachable", return_value=False):
+            with mock.patch.object(engine, "fetch_one", side_effect=fake_fetch), \
+                 mock.patch("app.core.job_manager.extract_fields",
+                            side_effect=lambda page, fields: {"business_name": "X"}):
+                messages = _run_worker(worker)
+
+    joined = "\n".join(messages)
+    # the other host kept flowing BEFORE any park sleep was paid
+    yelp_fetches = [(u, s) for u, s in fetched if "yelp.com" in u]
+    assert len(yelp_fetches) == 2 and all(s == 0 for _, s in yelp_fetches), fetched
+    park_sleeps = [s for s in sleeps if s >= 30]
+    assert len(park_sleeps) <= 1, sleeps  # at most the single-host-park wait
+    assert "تأجيل" in joined         # the parked URL was still deferred...
+    assert "تخطي" in joined          # ...then dropped by the host cap
 
 
 def test_page_is_shell_detects_challenge_page():

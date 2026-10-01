@@ -106,6 +106,7 @@ class ScrapeJobWorker(QObject):
         self._brain: Optional[brain_mod.Brain] = None
         self._pacer: Optional[brain_mod.BurstPacer] = None
         self._requeues: dict[str, int] = {}   # parked-domain requeue guard
+        self._rotated_hosts: set[str] = set()  # hosts given ONE identity-rotation rescue per job
         # WAF-rescue memory (per job): hosts whose fast-HTTP fetch comes
         # back as a challenge shell. After one successful stealth rescue
         # the host's remaining URLs go straight to the stealth browser
@@ -113,6 +114,11 @@ class ScrapeJobWorker(QObject):
         # host is marked dead so we don't burn ~30s per URL on retries.
         self._force_browser_hosts: set[str] = set()
         self._browser_dead_hosts: set[str] = set()
+        # Hosts whose fast-HTTP lane proved BLOCKED (403/429...) and were
+        # handed to the stealth browser ONCE this job. Distinct from
+        # _force_browser_hosts so a failed stealth handover doesn't get
+        # re-attempted forever through the shell-rescue path.
+        self._stealth_escalated_hosts: set[str] = set()
         self._mode_options: dict = {}
         self._robots_cache: dict = {}
         self._raw_by_alias: dict[str, str] = {}
@@ -237,6 +243,62 @@ class ScrapeJobWorker(QObject):
                     # dropped for this job and the loop moves on / ends.
                     host = brain_mod.host_of(url)
                     self._requeues[host] = self._requeues.get(host, 0) + 1
+
+                    # Fight before flight #1 - the stealth browser: the fast
+                    # lane just proved BLOCKED for this host, and scrapling's
+                    # stealth engine is exactly what passes those walls (same
+                    # escalation the WAF-shell rescue uses below). Hand the
+                    # host's URLs to the browser immediately instead of
+                    # deferring them through 30s-sleep cycles that produce
+                    # nothing (the yellowpages 403 session: minutes of
+                    # "تأجيل" logs, zero leads, then everything dropped).
+                    if self._stealth_escalation_possible(url, host):
+                        self._stealth_escalated_hosts.add(host)
+                        self._force_browser_hosts.add(host)
+                        self._requeues[host] = 0
+                        # The browser identity gets a clean slate - the
+                        # parked reputation belongs to the fast lane.
+                        self._brain.unlock(host)
+                        self._emit_log(LogLevel.INFO,
+                                       f"الجلب السريع محجوب على {host} - "
+                                       "تحويل روابطه لمتصفح stealth (scrapling) بدل التأجيل")
+                        queue.append((url, depth))
+                        continue
+
+                    # Fight before flight #2 - identity rotation: a parked
+                    # domain gets ONE identity
+                    # rotation per job. Two cases:
+                    # 1. proxy modes with an identity pool (tor/hybrid/list/
+                    #    rotating): rotate the identity (NEWNYM / next proxy).
+                    # 2. Standard connection ("none"): "Tor وقت الحاجة" -
+                    #    the direct IP just proved blocked for this domain,
+                    #    so NOW (and only now) escalate the run to Tor.
+                    #    (_rotate_identity_on_block is fire-and-forget: it
+                    #    returns None, so "can we rotate?" is answered by the
+                    #    configured mode / Tor reachability.)
+                    if self._requeues[host] == 2 and host not in self._rotated_hosts:
+                        self._rotated_hosts.add(host)
+                        identity_changed = (
+                            self.options.proxy.mode in ("tor", "hybrid")
+                            or (self.options.proxy.mode in ("list", "rotating")
+                                and bool(self._proxy_pool))
+                        )
+                        if (not identity_changed
+                                and self.options.proxy.mode == "none"
+                                and anonymity.tor_reachable(self.options.proxy.tor_socks_port)):
+                            self.options.proxy.mode = "tor"
+                            identity_changed = True
+                            self._emit_log(LogLevel.INFO,
+                                           f"الاتصال المباشر اتحجب عند {host} - "
+                                           "تور اشتغل وقت الحاجة (باقي الكامبين على تور)")
+                        if identity_changed:
+                            self._rotate_identity_on_block(url, "circuit breaker park")
+                            self._brain.unlock(host)
+                            self._requeues[host] = 0
+                            self._emit_log(LogLevel.INFO,
+                                           f"بدّلنا الهوية (IP جديد) - بنعيد محاولة {host} بهوية نضيفة")
+                            queue.append((url, depth))
+                            continue
                     if self._requeues[host] > 2:
                         dropped_urls = [(u, d) for (u, d) in queue
                                         if brain_mod.host_of(u) == host]
@@ -257,11 +319,21 @@ class ScrapeJobWorker(QObject):
                                            "إنهاء المهمة مبكرا. شغّل المهمة لاحقا أو "
                                            "فعّل بروكسي/Tor لتغيير الهوية")
                         continue
+                    # Genuine park (stealth already tried/failed, or a
+                    # browser-lane job): requeue at the END of the queue so
+                    # other hosts keep flowing - the old per-deferral 30s
+                    # sleep stalled the WHOLE job behind one parked host
+                    # (mixed yellowpages/yelp run: yelp's stealth pages
+                    # waited out yellowpages' defer cycles for no gain).
+                    # Sleep only when nothing else is fetchable, so a
+                    # single-host run still waits out the park window
+                    # instead of hot-spinning.
                     queue.append((url, depth))
                     self._emit_log(LogLevel.INFO,
                                    f"النطاق تحت ضغط حماية عالي - تأجيل {url} "
-                                   f"ل~{brain_mod.Brain.BREAKER_PARK_S // 60} دقيقة")
-                    self._interruptible_sleep(30)
+                                   f"لآخر القائمة (نافذة ~{int(brain_mod.Brain.BREAKER_PARK_S // 60)} دقيقة)")
+                    if queue and all(not self._brain.gate(u) for u, _d in queue):
+                        self._interruptible_sleep(30)
                     continue
 
                 # Per-source engine override happens after _resolve_source
@@ -319,6 +391,30 @@ class ScrapeJobWorker(QObject):
                 pages_done += 1
 
                 if error is not None:
+                    # Fight before flight: a BLOCK (403/429/Cloudflare...) on
+                    # the fast lane is the moment to hand the host to the
+                    # stealth browser - scrapling's stealth engine is what
+                    # passes those walls - instead of finishing the retry
+                    # loop, counting the page as failed, and leaving the
+                    # rest of the host's URLs to hit the same wall.
+                    if (anonymity.looks_like_block(error)
+                            and self._stealth_escalation_possible(url, host)):
+                        self._stealth_escalated_hosts.add(host)
+                        self._force_browser_hosts.add(host)
+                        self._requeues[host] = 0
+                        if self._brain is not None:
+                            self._brain.unlock(host)
+                        self._emit_log(LogLevel.WARNING,
+                                       f"الحماية رفضت {host} على الجلب السريع - "
+                                       "بنحوّل باقي روابطه لمتصفح stealth (scrapling)")
+                        # This URL goes back through the queue and comes
+                        # back via the browser lane (it was already marked
+                        # 'in_progress' and counted as a done page above).
+                        self.db.queue_mark(self.job_id, url, "pending")
+                        pages_done = max(0, pages_done - 1)
+                        queue.append((url, depth))
+                        emit_progress()
+                        continue
                     records_failed += 1
                     self.db.queue_mark(self.job_id, url, "failed")
                     self._emit_log(LogLevel.ERROR, f"فشل جلب {url}: {error}")
@@ -672,6 +768,18 @@ class ScrapeJobWorker(QObject):
         else:
             return False
         return True
+
+    def _stealth_escalation_possible(self, url: str, host: str) -> bool:
+        """True when a blocked host can still be fought with the stealth
+        browser: fast-HTTP job (the lane the _force_browser_hosts branch
+        routes from), the host's source profile doesn't already declare a
+        browser lane (yelp/thumbtack), and stealth hasn't already been
+        tried and failed for it this job."""
+        if self.options.fetcher_mode != FetcherMode.FAST_HTTP:
+            return False
+        if host in self._stealth_escalated_hosts or host in self._browser_dead_hosts:
+            return False
+        return self._source_fetcher_mode(url) is None
 
     def _source_fetcher_mode(self, url: str):
         """The engine this URL's source profile declares (STEALTH for
@@ -1334,7 +1442,8 @@ class JobManager(QObject):
                         source_profiles: Optional[list[dict]]) -> dict:
         spec = {
             "target": asdict(target),
-            "options": {**asdict(options), "fetcher_mode": options.fetcher_mode.value},
+            "options": {**asdict(options),
+                        "fetcher_mode": getattr(options.fetcher_mode, "value", options.fetcher_mode)},
             "fields": [f.to_dict() for f in fields],
             "container": container,
             "detail_config": detail_config,
