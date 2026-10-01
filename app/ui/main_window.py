@@ -22,6 +22,7 @@ from app.ui.screens.dashboard import DashboardScreen
 from app.ui.screens.projects import ProjectsScreen
 from app.ui.screens.history import HistoryScreen
 from app.ui.screens.templates import TemplatesScreen
+from app.ui.screens.icp import IcpScreen
 from app.ui.screens.settings import SettingsScreen
 from app.ui.screens.api_keys import ApiKeysScreen
 from app.ui.screens.logs import LogsScreen
@@ -107,6 +108,7 @@ class MainWindow(QMainWindow):
         self.projects_screen = ProjectsScreen(self.db)
         self.history_screen = HistoryScreen(self.db)
         self.templates_screen = TemplatesScreen(self.db)
+        self.icp_screen = IcpScreen(self.db)
         self.settings_screen = SettingsScreen(self.db)
         self.api_keys_screen = ApiKeysScreen(self.db)
         self.logs_screen = LogsScreen(self.db)
@@ -117,6 +119,7 @@ class MainWindow(QMainWindow):
             "projects": self.projects_screen,
             "history": self.history_screen,
             "templates": self.templates_screen,
+            "icp": self.icp_screen,
             "settings": self.settings_screen,
             "api_keys": self.api_keys_screen,
             "logs": self.logs_screen,
@@ -130,6 +133,11 @@ class MainWindow(QMainWindow):
         self.projects_screen.open_project.connect(self._open_project_in_new_scrape)
         self.templates_screen.use_template.connect(self._use_template_in_new_scrape)
         self.history_screen.resume_requested.connect(self._resume_job_in_new_scrape)
+        # ICP -> crawler handoff: the discovered/selected source URLs land
+        # in New Campaign's URL box (existing flow untouched - the main
+        # crawler remains the only thing that fetches pages).
+        self.icp_screen.send_to_crawler.connect(self._send_urls_to_crawler)
+
         # Crash recovery sweep (audit C3): anything still 'running' with no
         # recent heartbeat is from a dead process - mark INTERRUPTED and
         # recompute its counters from the committed results, so History
@@ -244,6 +252,17 @@ class MainWindow(QMainWindow):
         self._navigate("new_scrape")
         self.new_scrape_screen._resume_job(job_id)
 
+    def _send_urls_to_crawler(self, urls: list):
+        """ICP discovery -> existing crawler: prefill New Campaign's URLs
+        and jump there. Does NOT auto-start - the user reviews and presses
+        Start like any campaign."""
+        from urllib.parse import urlparse
+        valid = [u for u in urls if urlparse(u).scheme in ("http", "https")]
+        self.new_scrape_screen.urls_input.setPlainText("\n".join(valid))
+        self._navigate("new_scrape")
+        self.new_scrape_screen.log_panel.append_entry(
+            "INFO", f"وصل {len(valid)} رابط من اكتشاف الـ ICP - راجعهم وابدأ الحملة")
+
     def _run_recovery_sweep(self):
         """Mark orphaned 'running' jobs (dead process, no heartbeat in the
         90s window) as INTERRUPTED. Runs at startup AND every 60s (audit
@@ -254,6 +273,11 @@ class MainWindow(QMainWindow):
             return
         try:
             stale = self.db.mark_stale_running_as_interrupted()
+            # Runs right after the sweep so freshly-marked INTERRUPTED
+            # jobs keep their resume checkpoints; only the never-resumable
+            # terminal statuses (completed/failed/stopped) get purged
+            # (audit QA BUG-008).
+            self.db.purge_terminal_job_checkpoints()
         except Exception:
             return  # the sweep must never break the app
         if stale:

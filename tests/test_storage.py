@@ -181,3 +181,109 @@ def test_clear_job_history_keeps_running_job_and_lead_history():
         assert db.lead_seen_before("fp-1") is not None
 
 
+def test_purge_terminal_job_checkpoints():
+    """BUG-008 regression: a single stopped job kept 100,000 job_queue rows
+    in the production DB forever. Completed/failed/stopped jobs can never
+    be resumed - their queue/spec checkpoints are purgeable; interrupted
+    (resumable) and running jobs must keep theirs."""
+    with temp_db() as db:
+        pid = db.create_project("P", {})
+        done_id = db.create_job(pid)
+        db.finish_job(done_id, "completed")
+        db.set_job_spec(done_id, {"a": 1})
+        db.queue_replace(done_id, [("https://x.com/1", 0), ("https://x.com/2", 0)])
+
+        stopped_id = db.create_job(pid)
+        db.finish_job(stopped_id, "stopped")
+        db.queue_replace(stopped_id, [("https://x.com/3", 0)])
+
+        interrupted_id = db.create_job(pid)
+        db.finish_job(interrupted_id, "interrupted")
+        db.set_job_spec(interrupted_id, {"b": 2})
+        db.queue_replace(interrupted_id, [("https://x.com/4", 0)])
+
+        running_id = db.create_job(pid)
+        db.queue_replace(running_id, [("https://x.com/5", 0)])
+
+        purged = db.purge_terminal_job_checkpoints()
+        assert purged == 3          # 2 (completed) + 1 (stopped)
+        assert db.queue_counts(done_id) == {}
+        assert db.queue_counts(stopped_id) == {}
+        assert db.get_job_spec(done_id) is None
+        assert db.get_job_spec(stopped_id) is None
+        # interrupted + running keep their resume checkpoints
+        assert db.queue_counts(interrupted_id) == {"pending": 1}
+        assert db.get_job_spec(interrupted_id) == {"b": 2}
+        assert db.queue_counts(running_id) == {"pending": 1}
+        assert db.count_jobs() == 4
+        # idempotent
+        assert db.purge_terminal_job_checkpoints() == 0
+
+
+def test_custom_sources_crud():
+    with temp_db() as db:
+        assert db.list_custom_sources() == []
+
+        source_id = db.create_custom_source(
+            "thumbtack", "thumbtack.com",
+            {"selector": ".card", "type": "css"},
+            [{"name": "business_name", "selector": ".name"}],
+            {"link_field": "profile_url", "fields": [], "regex_fields": {"phone": r"\d{3}-\d{4}"}},
+        )
+        rows = db.list_custom_sources()
+        assert len(rows) == 1
+        assert rows[0]["id"] == source_id
+        assert rows[0]["name"] == "thumbtack"
+        assert json.loads(rows[0]["container_json"])["selector"] == ".card"
+
+        db.update_custom_source(
+            source_id, "thumbtack (fixed)", "thumbtack.com",
+            {"selector": ".real-card", "type": "css"},
+            [{"name": "business_name", "selector": ".real-name"}],
+            None,
+        )
+        updated = db.list_custom_sources()[0]
+        assert updated["name"] == "thumbtack (fixed)"
+        assert json.loads(updated["container_json"])["selector"] == ".real-card"
+        assert updated["detail_config_json"] is None
+
+        db.delete_custom_source(source_id)
+        assert db.list_custom_sources() == []
+
+
+def test_db_usable_from_a_background_thread():
+    """Regression test for the bug that made Stop/progress/log all appear
+    broken at once: the Database was opened with sqlite3's default
+    check_same_thread=True on the GUI thread, then ScrapeJobWorker (which
+    runs on a separate QThread) called self.db.add_log(...) as the very
+    first thing in run() - outside any try/except - and that raised
+    sqlite3.ProgrammingError immediately, silently killing the worker
+    thread before it ever reached the code that checks _stop_requested or
+    emits progress. This test reproduces the shape of that access
+    (create the Database on this/"main" thread, use it from a different
+    thread) with plain `threading` instead of Qt, since PySide6 isn't
+    installable in this sandbox - the fix (check_same_thread=False + an
+    RLock in Database.cursor()) must make this thread-safe."""
+    with temp_db() as db:
+        pid = db.create_project("P", {})
+        job_id = db.create_job(pid, pages_total=1)
+        errors = []
+
+        def worker():
+            try:
+                db.add_log(job_id, "INFO", "from background thread")
+                db.add_result(job_id, "https://example.com", {"a": 1})
+                db.update_job_progress(job_id, 1, 1, 0)
+                db.finish_job(job_id, "completed")
+            except Exception as e:  # pragma: no cover - the assertion below is what matters
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=5)
+
+        assert not errors, f"Database call from a background thread raised: {errors}"
+        logs = db.list_logs(job_id)
+        assert any("from background thread" in l["message"] for l in logs)
+        job = db.get_job(job_id)
+        assert job["status"] == "completed"

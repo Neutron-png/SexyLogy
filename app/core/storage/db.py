@@ -133,6 +133,42 @@ CREATE TABLE IF NOT EXISTS job_specs (
     created_at REAL NOT NULL
 );
 
+-- LOGY Search (app/core/search): zero-cost internal SERP layer.
+-- Cache of normalized search responses keyed over the full request
+-- params; TTL enforced by cache.py at read time (created_at + ttl).
+CREATE TABLE IF NOT EXISTS search_cache (
+    key TEXT PRIMARY KEY,
+    response_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+-- Durable per-request record for observability ("why did this ICP
+-- search return nothing?") + the service's metrics counters.
+CREATE TABLE IF NOT EXISTS search_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT,
+    query TEXT NOT NULL,
+    page INTEGER NOT NULL,
+    provider TEXT NOT NULL,     -- provider that served it ('none' on failure)
+    status TEXT NOT NULL,       -- ok | cached | failed
+    latency_ms INTEGER,
+    num_results INTEGER,
+    error TEXT,
+    ts REAL NOT NULL
+);
+
+-- Structured ICP profiles (ICP Intelligence): the reviewed/edited
+-- representation the user approved after upload+analysis. Raw document
+-- text is NOT stored here - only the structured profile (and the
+-- source file name/hash for provenance).
+CREATE TABLE IF NOT EXISTS icp_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    structured_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -567,6 +603,25 @@ class Database:
                 (job_id,),
             ).fetchall()
         return {r["state"]: r["n"] for r in rows}
+
+    def purge_terminal_job_checkpoints(self) -> int:
+        """Drops the job_queue/job_specs checkpoint rows of jobs that can
+        NEVER be resumed (completed/failed/stopped). Interrupted jobs keep
+        theirs - the checkpoint IS what resume works from (audit QA
+        BUG-008: a single stopped job had kept 100,000 queue rows in the
+        production DB forever). Returns how many queue rows were removed.
+        Safe to call any time: running/interrupted jobs are excluded."""
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM job_queue WHERE job_id IN "
+                "(SELECT id FROM jobs WHERE status IN ('completed', 'failed', 'stopped'))"
+            )
+            removed = cur.rowcount
+            cur.execute(
+                "DELETE FROM job_specs WHERE job_id IN "
+                "(SELECT id FROM jobs WHERE status IN ('completed', 'failed', 'stopped'))"
+            )
+            return removed
 
     def mark_stale_running_as_interrupted(self, older_than_s: float = 90.0) -> list[int]:
         """Crash recovery sweep: any job still 'running' whose last DB
