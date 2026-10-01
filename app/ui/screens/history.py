@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime
 import json
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QMessageBox,
@@ -56,6 +56,15 @@ class HistoryScreen(QWidget):
         title.setObjectName("pageTitle")
         header_row.addWidget(title)
         header_row.addStretch(1)
+        self.delete_history_btn = QPushButton("Delete History")
+        self.delete_history_btn.setObjectName("dangerButton")
+        self.delete_history_btn.setToolTip(
+            "Deletes every job run in History (along with its results, logs and saved "
+            "resume data). Leads History is NOT touched - clearing that memory is a "
+            "separate, explicit action in its own tab."
+        )
+        self.delete_history_btn.clicked.connect(self._delete_history)
+        header_row.addWidget(self.delete_history_btn)
         self.resume_btn = QPushButton("Resume interrupted job")
         self.resume_btn.setObjectName("primaryButton")
         self.resume_btn.setVisible(False)
@@ -119,11 +128,65 @@ class HistoryScreen(QWidget):
         self.jobs_table.setAlternatingRowColors(True)
         self.jobs_table.itemSelectionChanged.connect(self._sync_resume_btn)
         layout.addWidget(self.jobs_table, 1)
+
+        self.jobs_empty_label = QLabel(
+            "No history yet - run a scrape from New Scrape and it will appear here."
+        )
+        self.jobs_empty_label.setWordWrap(True)
+        self.jobs_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.jobs_empty_label.setStyleSheet("color: #8B95A7; font-size: 12px;")
+        self.jobs_empty_label.setVisible(False)
+        layout.addWidget(self.jobs_empty_label)
         return w
 
     def _sync_resume_btn(self):
         job = self._selected_job()
         self.resume_btn.setVisible(bool(job and job["status"] == "interrupted"))
+
+    # ------------------------------------------------------------------
+    # Delete all history (Job Runs tab data)
+    # ------------------------------------------------------------------
+    def _delete_history(self):
+        try:
+            running = self.db.count_running_jobs()
+            if running:
+                QMessageBox.warning(
+                    self, "Delete History",
+                    "A scrape is currently running - its record can't be deleted "
+                    "while the worker is writing to it.\nStop or wait for the scrape "
+                    "to finish, then delete the history again.",
+                )
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "Delete History", f"Could not read the history before deleting:\n{e}")
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Delete all history?")
+        box.setText("Delete all history?")
+        box.setInformativeText(
+            "This permanently deletes every job run along with its results, logs and "
+            "saved resume data. This action cannot be undone."
+        )
+        cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        delete_btn = box.addButton("Delete", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        if box.clickedButton() is not delete_btn:
+            return
+
+        try:
+            self.db.clear_job_history()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Delete failed",
+                f"The history could not be deleted:\n{e}\n"
+                "Nothing was removed - try again after closing any open database browser.",
+            )
+            return
+        self.refresh()
+        self._sync_resume_btn()
 
     # ------------------------------------------------------------------
     # Leads History tab (new)
@@ -229,6 +292,9 @@ class HistoryScreen(QWidget):
             for col, value in enumerate(values):
                 self.jobs_table.setItem(row, col, QTableWidgetItem(value))
 
+        self.jobs_empty_label.setVisible(not jobs)
+        self.delete_history_btn.setEnabled(bool(jobs))
+        self._sync_resume_btn()
         self._refresh_leads()
 
     def showEvent(self, event):

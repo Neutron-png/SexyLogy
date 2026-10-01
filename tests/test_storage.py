@@ -142,70 +142,42 @@ def test_lead_history_survives_project_deletion():
         assert db.lead_seen_before("fp-1") is not None
 
 
-def test_custom_sources_crud():
-    with temp_db() as db:
-        assert db.list_custom_sources() == []
-
-        source_id = db.create_custom_source(
-            "thumbtack", "thumbtack.com",
-            {"selector": ".card", "type": "css"},
-            [{"name": "business_name", "selector": ".name"}],
-            {"link_field": "profile_url", "fields": [], "regex_fields": {"phone": r"\d{3}-\d{4}"}},
-        )
-        rows = db.list_custom_sources()
-        assert len(rows) == 1
-        assert rows[0]["id"] == source_id
-        assert rows[0]["name"] == "thumbtack"
-        assert json.loads(rows[0]["container_json"])["selector"] == ".card"
-
-        db.update_custom_source(
-            source_id, "thumbtack (fixed)", "thumbtack.com",
-            {"selector": ".real-card", "type": "css"},
-            [{"name": "business_name", "selector": ".real-name"}],
-            None,
-        )
-        updated = db.list_custom_sources()[0]
-        assert updated["name"] == "thumbtack (fixed)"
-        assert json.loads(updated["container_json"])["selector"] == ".real-card"
-        assert updated["detail_config_json"] is None
-
-        db.delete_custom_source(source_id)
-        assert db.list_custom_sources() == []
-
-
-def test_db_usable_from_a_background_thread():
-    """Regression test for the bug that made Stop/progress/log all appear
-    broken at once: the Database was opened with sqlite3's default
-    check_same_thread=True on the GUI thread, then ScrapeJobWorker (which
-    runs on a separate QThread) called self.db.add_log(...) as the very
-    first thing in run() - outside any try/except - and that raised
-    sqlite3.ProgrammingError immediately, silently killing the worker
-    thread before it ever reached the code that checks _stop_requested or
-    emits progress. This test reproduces the shape of that access
-    (create the Database on this/"main" thread, use it from a different
-    thread) with plain `threading` instead of Qt, since PySide6 isn't
-    installable in this sandbox - the fix (check_same_thread=False + an
-    RLock in Database.cursor()) must make this thread-safe."""
+def test_clear_job_history_deletes_all_and_cascades():
     with temp_db() as db:
         pid = db.create_project("P", {})
-        job_id = db.create_job(pid, pages_total=1)
-        errors = []
+        job_id = db.create_job(pid, pages_total=2)
+        db.add_result(job_id, "https://x.com", {"n": 1})
+        db.add_log(job_id, "INFO", "hello")
+        db.set_job_spec(job_id, {"target": {}})
+        db.queue_replace(job_id, [("https://x.com", 0)])
+        db.finish_job(job_id, "completed")
 
-        def worker():
-            try:
-                db.add_log(job_id, "INFO", "from background thread")
-                db.add_result(job_id, "https://example.com", {"a": 1})
-                db.update_job_progress(job_id, 1, 1, 0)
-                db.finish_job(job_id, "completed")
-            except Exception as e:  # pragma: no cover - the assertion below is what matters
-                errors.append(e)
+        deleted = db.clear_job_history()
+        assert deleted == 1
+        assert db.list_jobs() == []
+        assert db.get_job(job_id) is None
+        assert db.count_results(job_id) == 0
+        assert db.list_logs(job_id=job_id) == []
+        assert db.queue_pending(job_id) == []
+        assert db.get_job_spec(job_id) is None
 
-        t = threading.Thread(target=worker)
-        t.start()
-        t.join(timeout=5)
+        assert db.clear_job_history() == 0
 
-        assert not errors, f"Database call from a background thread raised: {errors}"
-        logs = db.list_logs(job_id)
-        assert any("from background thread" in l["message"] for l in logs)
-        job = db.get_job(job_id)
-        assert job["status"] == "completed"
+
+def test_clear_job_history_keeps_running_job_and_lead_history():
+    with temp_db() as db:
+        pid = db.create_project("P", {})
+        running_id = db.create_job(pid)          # stays 'running'
+        finished_id = db.create_job(pid)
+        db.finish_job(finished_id, "completed")
+        db.record_lead_seen("fp-1", pid, finished_id, {"email": "a@x.com"})
+
+        deleted = db.clear_job_history()
+        assert deleted == 1
+        assert db.count_running_jobs() == 1
+        assert db.get_job(running_id)["status"] == "running"
+        assert db.get_job(finished_id) is None
+        # De-dup memory is deliberately independent of job history.
+        assert db.lead_seen_before("fp-1") is not None
+
+

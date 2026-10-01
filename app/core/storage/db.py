@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS job_specs (
     spec_json TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+
 """
 
 
@@ -273,6 +274,32 @@ class Database:
         with self.cursor() as cur:
             cur.execute("SELECT * FROM jobs ORDER BY started_at DESC LIMIT ?", (limit,))
             return [dict(r) for r in cur.fetchall()]
+
+    def count_jobs(self) -> int:
+        with self.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM jobs")
+            return cur.fetchone()[0]
+
+    def count_running_jobs(self) -> int:
+        """How many jobs are live RIGHT NOW (a background worker thread is
+        writing results/logs/progress by that job_id). History deletion
+        must never touch these rows - deleting a running job's row would
+        orphan every subsequent worker write for it."""
+        with self.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM jobs WHERE status = 'running'")
+            return cur.fetchone()[0]
+
+    def clear_job_history(self) -> int:
+        """Deletes every non-running job run, returning how many were
+        removed. results/logs/job_queue/job_specs go with them through
+        their ON DELETE CASCADE (PRAGMA foreign_keys = ON), while
+        lead_history deliberately survives - it is the cross-job de-dup
+        memory, intentionally not FK'd to jobs (see the SCHEMA comment
+        there); clearing it is a separate, explicit action
+        (clear_lead_history)."""
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM jobs WHERE status != 'running'")
+            return cur.rowcount
 
     def get_job(self, job_id: int) -> Optional[dict]:
         with self.cursor() as cur:
