@@ -205,6 +205,59 @@ def test_parked_host_defer_no_longer_stalls_other_hosts():
     assert "تخطي" in joined          # ...then dropped by the host cap
 
 
+def _run_worker_capture_levels(worker: ScrapeJobWorker) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    worker.log.connect(lambda level, msg: entries.append((level, msg)))
+    try:
+        worker.run()
+    finally:
+        worker.db.close()
+    return entries
+
+
+def test_summary_with_failures_is_warning_not_success():
+    """BUG-007 regression: 'completed - 0 سجل ناجح، 1 خطأ' was emitted at
+    SUCCESS level - a green summary line for a job that fetched nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        worker = _make_worker(Path(tmp), ["https://www.yellowpages.com/x/"])
+        worker._interruptible_sleep = lambda seconds: None
+        worker._setup_brain = lambda: None
+        worker._brain = None
+        with mock.patch.object(engine, "fetch_one", side_effect=_fake_fetch_403):
+            entries = _run_worker_capture_levels(worker)
+
+    summary = [(lv, m) for lv, m in entries if "انتهت المهمة" in m]
+    assert summary, entries
+    level, msg = summary[-1]
+    assert "1 خطأ" in msg
+    assert level == "WARNING", summary
+
+
+def test_summary_clean_completed_is_success():
+    with tempfile.TemporaryDirectory() as tmp:
+        worker = _make_worker(Path(tmp), ["https://www.yellowpages.com/x/"])
+        worker._interruptible_sleep = lambda seconds: None
+        worker._setup_brain = lambda: None
+        worker._brain = None
+        worker.container = {"selector": "div.result", "type": "css"}
+        worker._base_container = worker.container
+        real = "<html><head><title>ok</title></head><body><div class='result'>x</div>" + "y" * 6000 + "</body></html>"
+
+        def fake_fetch(url, options, should_stop=None, cache=None, wait_selector=None, session=None):
+            if url.endswith("/robots.txt"):
+                return mock.MagicMock(status=200, ok=True, page=_FakePage(REAL_HTML))
+            return mock.MagicMock(status=200, ok=True, page=_FakePage(real))
+
+        with mock.patch.object(engine, "fetch_one", side_effect=fake_fetch), \
+             mock.patch("app.core.job_manager.extract_records",
+                        side_effect=lambda page, *a, **k: [{"business_name": "D"}]):
+            entries = _run_worker_capture_levels(worker)
+
+    summary = [(lv, m) for lv, m in entries if "انتهت المهمة" in m]
+    assert summary
+    assert summary[-1][0] == "SUCCESS"
+
+
 def test_page_is_shell_detects_challenge_page():
     with tempfile.TemporaryDirectory() as tmp:
         worker = _make_worker(Path(tmp), ["https://www.thumbtack.com/x/"])

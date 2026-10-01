@@ -552,10 +552,13 @@ class ScrapeJobWorker(QObject):
             summary = f"انتهت المهمة: {final_status.value} - {records_ok} سجل ناجح، {records_failed} خطأ"
             if duplicates_skipped:
                 summary += f"، {duplicates_skipped} ليد مكرر تم تخطيه (ظهر في سكرابنج سابق)"
-            self._emit_log(
-                LogLevel.SUCCESS if final_status == JobStatus.COMPLETED else LogLevel.WARNING,
-                summary,
-            )
+            # A 'completed' job whose pages mostly errored is NOT a green
+            # success - log it at WARNING so the summary matches reality
+            # (audit QA BUG-007).
+            summary_level = (LogLevel.SUCCESS
+                             if final_status == JobStatus.COMPLETED and not records_failed
+                             else LogLevel.WARNING)
+            self._emit_log(summary_level, summary)
         except Exception as e:  # never let one bad page crash the whole run/app
             tb = traceback.format_exc()
             try:
