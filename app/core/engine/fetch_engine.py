@@ -90,7 +90,10 @@ def probe_proxies(proxies: list[str], timeout_s: float = 8.0) -> tuple[list[str]
             return proxy, False
 
     alive, dead = [], []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(proxies)))) as pool:
+    # 64 workers: a 400-proxy pool probes in <1 min (8 workers took ~7 min
+    # and stalled every hybrid campaign's pre-flight). The cheap HEAD-like
+    # GET to example.com is I/O-bound, so this concurrency is safe.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(64, max(1, len(proxies)))) as pool:
         for proxy, ok in pool.map(_probe, proxies):
             (alive if ok else dead).append(proxy)
     return alive, dead
@@ -510,12 +513,6 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None, cache: Optiona
     # validated the status - it returned a complete FetchResult.
     if isinstance(page, FetchResult):
         return page
-
-    status = getattr(page, "status", None)
-    ok = status is None or (200 <= int(status) < 400)
-    if not ok:
-        raise FetchError(url, f"HTTP {status}")
-
     # ---- cache store / revalidate ----
     if use_cache:
         status_int = int(status) if status is not None else 200
@@ -667,7 +664,21 @@ class _BrowserSessionHandle(_SessionHandleBase):
             kwargs["disable_resources"] = True
         if options.block_ads:
             kwargs["block_ads"] = True
-        if proxy_override:
+        if proxy_override and getattr(self._session, "browser", None):
+            # scrapling's per-fetch `proxy=` is its ROTATION branch: it
+            # builds a fresh browser context for the proxy, which only
+            # exists when the session launched a separate `browser`
+            # (cdp_url / proxy_rotator setups). Persistent-context
+            # sessions (LOGY's StealthySession/DynamicSession) keep
+            # browser=None and scrapling RAISES
+            # "Browser not initialized for proxy rotation mode" the
+            # moment a proxy override is passed - this was the exact
+            # "53 errors / 0 records" failure of every browser-lane page
+            # under tor/hybrid/list/rotating modes (verified live:
+            # yellowpages 403 -> stealth handover -> every URL failed).
+            # Those sessions carry the STATIC proxy from construction;
+            # Tor's NEWNYM still rotates the exit IP behind the same
+            # SOCKS endpoint, so identity rotation keeps working.
             kwargs["proxy"] = _normalize_tor_scheme(proxy_override, for_http=False)
         page = self._session.fetch(url, **kwargs)
         status = getattr(page, "status", None)
