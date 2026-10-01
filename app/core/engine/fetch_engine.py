@@ -512,7 +512,25 @@ def fetch_one(url: str, options: ScrapeOptions, should_stop=None, cache: Optiona
     # Session path: the handle already unwrapped its inner Response and
     # validated the status - it returned a complete FetchResult.
     if isinstance(page, FetchResult):
+        # BUG-002: the browser-session handle computes `ok` but does NOT
+        # raise on a bad status (only the fast-session handle does), and
+        # this early return skipped the status check the non-session
+        # path applies below. A session fetch that landed a 403/429
+        # interstitial (e.g. the wait-selector timed out on a challenge
+        # page) was returned as a SUCCESSFUL fetch - the job manager
+        # logged "تم الجلب" on a blocked page, fed a SUCCESS into the
+        # identity brain instead of a block signal, and reported a
+        # quiet "0 records" instead of the real error. Same contract
+        # as the non-session path: a bad status is a FetchError.
+        if not page.ok:
+            raise FetchError(url, f"HTTP {page.status}")
         return page
+
+    status = getattr(page, "status", None)
+    ok = status is None or (200 <= int(status) < 400)
+    if not ok:
+        raise FetchError(url, f"HTTP {status}")
+
     # ---- cache store / revalidate ----
     if use_cache:
         status_int = int(status) if status is not None else 200
