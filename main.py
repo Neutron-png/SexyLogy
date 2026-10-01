@@ -4,6 +4,8 @@ this is the only place that owns the QApplication lifecycle.
 """
 from __future__ import annotations
 
+import utils.transport
+import utils.session
 import sys
 from pathlib import Path
 

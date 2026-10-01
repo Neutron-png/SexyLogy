@@ -1,46 +1,133 @@
-# LOGY — Anonymous Lead-Generation Crawler
+<img src="docs/assets/readme/banner.png" alt="LOGY — Lead | Opportunities | Generate | Yield" width="100%">
 
-LOGY is a desktop (PySide6) lead-generation scraper built on custom scraping engine
-point it at business directories (Yelp, Yellowpages, Thumbtack…), pick a niche + city, and it crawls,
-extracts, deduplicates and exports leads — now with a full **per-request identity-rotation engine**
-so targets can't fingerprint a single IP.
+# Find the leads everyone else gets blocked from.
 
----
+LOGY is a desktop lead-generation crawler. Point it at a niche and a set of cities, or drop in an ICP document, and it finds the businesses, pulls their contact details, scores how weak their online presence is, and hands you a clean export — while a per-request identity engine rotates IPs behind it so the same wall doesn't end your run.
 
-## What's new: the Anonymity Engine
+It ships with its own zero-cost search layer, so discovery never depends on a paid SERP API key.
 
-### The problem it solves
+<img src="docs/assets/readme/feature-results.webp" alt="A completed LOGY campaign showing progress, the live activity log and the extracted lead table">
 
-Two facts define web anonymity, and everything in this engine follows from them:
+## What is LOGY?
 
-1. **Websites never see your MAC address.** It's a layer-2 identifier that dies at the first router.
-   The *only* network identity a target can observe is your **IP address**. (This is why the engine
-   rotates IPs and deliberately fakes nothing else.)
-2. **Sites that "block Tor" are not detecting the browser.** Tor exit nodes are *publicly listed*;
-   targets match your IP against those lists. Disguising the client as Chromium fixes the
-   *fingerprint*, not the *gate*.
+LOGY is a self-contained lead-generation workspace:
 
-The historical bug this engine replaced: the UI collected a proxy list, the mode said "Rotating",
-but the adapter read `proxies[0]` every time — **one IP for an entire 500-page run** (the direct
-cause of the Yelp 403 wall: 91/91 requests failed).
+- **It crawls real directories** — yellowpages.com, Yelp and Thumbtack are captured and wired in out of the box, and you can add your own site with custom selectors.
+- **It rotates identities per request** — proxy pools, Tor circuits, or a hybrid of both, with instant failover the moment a target blocks one.
+- **It can start from an ICP** — upload a PDF/DOCX/TXT, review what LOGY understood, discover matching sources through its own search layer, and send the chosen URLs straight into the crawler.
+- **It remembers what it already found** — cross-campaign lead memory de-duplicates so re-running a niche surfaces only new leads.
+- **Everything lives in one app** — campaign wizard, live tables, history, templates, quality scoring and exports.
 
-### The pipeline
+No account, no cloud, no per-search fees. Your leads and your database stay on your machine.
 
+## A real campaign, end to end
+
+### Set up the campaign
+
+<img src="docs/assets/readme/feature-new-campaign.webp" alt="LOGY new campaign screen: niche, cities, sources and safety toggles">
+
+Pick a niche, choose the cities (or run *All Cities*), and decide how many links to search. Turn on **rate lead quality automatically** to score each lead's digital presence, and **find owner contacts from company sites (AI)** to enrich leads from pages they publish themselves.
+
+### Watch the engine work, then read the leads
+
+<img src="docs/assets/readme/feature-results.webp" alt="Completed LOGY run: 12/12 searched, 74 leads, 66 saved, 8 blocked and retried, with the lead table below">
+
+The run panel reports exactly what happened: pages searched, leads found, leads saved, blocks that were retried, and elapsed time. Below it, the live lead table fills in as records land — with a quality pill per lead (*Worth a look*, *No website*, *Low priority*) and the signals behind it.
+
+### Start from an ICP instead
+
+<img src="docs/assets/readme/feature-icp-campaigns.webp" alt="LOGY ICP Campaigns: structured ICP fields, discovery controls and qualified source list">
+
+Upload an ICP document and LOGY turns it into a structured profile — industries, keywords, locations, exclusions, company size, roles and qualifying signals — for you to review and edit. **Discover Sources** generates queries, runs them through the internal search layer, and returns a scored list of candidate sources with the reason each one qualified. **Crawl Selected** sends them to the normal campaign flow.
+
+### Track every run
+
+<img src="docs/assets/readme/feature-history-runs.webp" alt="LOGY history: job runs with status, pages, records and errors, plus resume for interrupted jobs">
+
+Every campaign is recorded with its status, pages, records and errors. A campaign killed mid-run comes back as **interrupted** and can be resumed from its checkpoint — completed pages are never fetched twice.
+
+<img src="docs/assets/readme/feature-history-leads.webp" alt="LOGY leads history: every lead ever generated, with first seen, last seen and times seen">
+
+Leads History is the cross-campaign memory: every lead LOGY has ever extracted, de-duplicated, with first-seen and last-seen dates. Fresh campaigns skip anyone already in here, so re-running a niche finds *new* businesses.
+
+### Keep the whole operation in view
+
+<img src="docs/assets/readme/feature-dashboard.webp" alt="LOGY dashboard summarising campaigns, leads and success rate">
+
+<img src="docs/assets/readme/feature-projects.webp" alt="LOGY projects screen listing saved campaign configurations">
+
+<img src="docs/assets/readme/feature-templates.webp" alt="LOGY templates with built-in niche presets">
+
+Reusable projects and built-in niche templates mean a new city is two clicks, not a fresh setup.
+
+<img src="docs/assets/readme/feature-settings-search.webp" alt="LOGY search provider settings: provider, cache TTL, pacing and concurrency">
+
+<img src="docs/assets/readme/feature-activity.webp" alt="LOGY activity log with structured run messages">
+
+## What you get
+
+- **One wizard, every source** — yellowpages, Yelp, Thumbtack, custom sites, or URLs discovered from an ICP, in the same run.
+- **Identity rotation that fails over instantly** — proxy list, single proxy, Tor, or hybrid; a blocked identity is dropped and the retry leaves from a different IP.
+- **Stealth when the fast lane is walled** — a `403` on the fast HTTP lane hands the host to a real stealth browser automatically, instead of burning the run against the same wall.
+- **Quality scoring built in** — each lead is scored for missing structured data, analytics, meta and more, so the weakest digital presence — your best prospects — sorts to the top. Presets for a range of niches are included.
+- **ICP → discovery → crawler** — an internal, zero-cost search layer (`DuckDuckGo` HTML with a `Bing` HTML fallback, optional self-hosted `SearXNG`) discovers sources; the crawler stays the only thing fetching pages.
+- **Cross-campaign de-duplication** — remembered leads never come back as new ones.
+- **Real exports** — CSV, JSON, JSONL, XLSX, and an Odoo-ready CRM import.
+- **AI where it earns its place** — optional AI Auto-Extract (no selectors needed) and owner-contact lookup from a company's own published pages, using your own saved API key.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A["You<br>niche + cities, or an ICP document"] --> B["Job manager<br>queue · retries · checkpointing"]
+    B --> C["Identity engine<br>proxy pool · Tor NEWNYM · failover"]
+    B --> D["Fetch engine<br>fast HTTP · dynamic · stealth"]
+    C --> E["Targets<br>yellowpages · Yelp · Thumbtack · your sources"]
+    D --> E
+    E --> F["Extract · qualify · de-duplicate"]
+    F --> G["Leads<br>table · CSV/XLSX · Odoo"]
+    H["LOGY Search<br>internal SERP · zero cost"] --> B
+    I["ICP document"] --> H
 ```
-┌──────────────┐    ┌───────────────────┐    ┌──────────────────┐
-│ REQUEST QUEUE│──▶ │ IDENTITY PICKER   │──▶ │ SCHEME NORMALIZER│──▶ TARGET SITE
-└──────────────┘    └─────────┬─────────┘    └────────┬─────────┘
-                              │ cyclic pool:          │ curl-cffi → socks5h:// (remote DNS)
-                              │  proxy-1, proxy-2,    │ chromium  → socks5://  (pw whitelist)
-                              │  tor@127.0.0.1:9050
-                              ▼
-                 ┌─────────────────────────────┐
-                 │ BLOCKED: 403 / 429 / CF     │
-                 └──────────────┬──────────────┘
-                                ▼
-                 INSTANT FAILOVER ── SIGNAL NEWNYM → control:9051 → new exit IP
-                                └─ skip identity → retry from a different IP
+
+The **UI never touches the scraping engine**: `UI → JobManager → fetch_engine → the scraping engine`. Sources are pluggable profiles, so adding a new site is a profile, not a rewrite.
+
+## Quick start
+
+**Requirements:** Windows (tested on Python 3.14), plus the browser engine's optional dependencies.
+
+```bat
+:: 1. install the scraping engine + its browser binaries
+pip install "scrapling[fetchers]"
+scrapling install
+
+:: 2. run the app
+run.bat
 ```
+
+Or directly:
+
+```bash
+pip install -r requirements.txt
+pip install "scrapling[fetchers]" && scrapling install
+python main.py
+```
+
+**Tor (optional, for anonymous runs):** download the Tor Expert Bundle once — LOGY boots it in the background and the `tor` / `hybrid` modes go live as soon as it's reachable:
+
+```bash
+python tools/setup_tor.py
+```
+
+Then, in the app: **Settings → Search** configures the internal search providers, and the campaign screen's **Scraping options** choose the proxy mode.
+
+## The anonymity engine
+
+### Why identity rotation, and nothing else
+
+Websites never see your MAC address — it dies at the first router. The only network identity a target can observe is your **IP address**. Sites that "block Tor" aren't fingerprinting the browser; they match your IP against the **publicly listed** Tor exit nodes. Disguising the client as Chrome fixes the *fingerprint*; only changing the IP gets past the *gate*.
+
+The historical bug this engine replaced: the UI collected a proxy list, the mode said *Rotating*, but the adapter read `proxies[0]` every time — **one IP for an entire 500-page run**, and a `91/91` failed Yelp wall.
 
 ### Proxy modes
 
@@ -50,219 +137,76 @@ cause of the Yelp 403 wall: 91/91 requests failed).
 | Single proxy | — | One dedicated exit, low-volume runs |
 | **Proxy list** | Cyclic per request + skip-on-block | Paid pools, stable identity set |
 | **Tor** | NEWNYM every N requests + on block | Full anonymity, tolerant targets |
-| **Hybrid** ⭐ | Proxies + Tor in ONE pool; blocked identities skipped instantly | Sites that blanket-block Tor exits |
+| **Hybrid** | Proxies + Tor in one pool; blocked identities skipped instantly | Sites that blanket-block Tor exits |
 
----
+### The math behind it
 
-## The algorithms & the math
+**Round-robin rotation** — a pool of `n` identities and a monotonic counter: `identity(t) = pool[(i₀ + t) mod n]`, perfectly uniform after each cycle. Against a WAF that blocks after `m` requests from one IP: single-IP capacity is `m`; rotated capacity is `≈ n·m` — anti-ban capacity grows linearly with pool size.
 
-### 1. Round-Robin cyclic rotation — `anonymity.CyclicProxyRotator`
+**Tor circuit rotation** — traffic leaves through a 3-node circuit (Guard → Middle → **Exit**); the target only sees the Exit. `SIGNAL NEWNYM` builds fresh circuits, and with `|E| ≈ 1000–1500` live exits, `P(new exit ≠ old) ≈ 99.9%`.
 
-A pool of `n` identities and a monotonic counter `i`. The request at step `t` takes
-entry `(i₀ + t) mod n`; the modulo wrap makes the list infinite.
+**Block classification** — a deliberately conservative marker classifier (`403/429/503`, `cloudflare`, `captcha`, `forbidden`, `banned`, `blocked`). False negatives cost a wasted retry; false positives throw away a good identity — so `404` and "connection refused" are *not* markers.
 
-```
-identity(t)      = pool[(i₀ + t) mod n]
-P(identity = pool_j) = 1/n          # perfectly uniform after every cycle
-λ_identity        = λ_total / n     # per-identity request rate
-```
+**Instant failover** — on a detected block the engine doesn't wait for the scheduled window; it jumps ahead in the pool (`skip = min(2, n−1)`, so the new identity is never the blocked one) and retries immediately, from a different IP. Retry success is geometric: with a clean-identity probability `q = 0.8`, success reaches **96% by the second try**.
 
-Most WAFs decide on a *threshold*: "after m requests from one IP → block".
-Single IP dies at `m`. Under uniform rotation, the capacity is:
+**Hybrid pooling** — user proxies and Tor merge into one pool. If a fraction `f` of the pool is blocked, a double failure needs two independent draws: `f²` instead of `f` (at `f = 0.2`: **4%**, versus 100% on a Tor-only run).
 
-```
-T_block(single IP) = m
-T_block(rotated)   ≈ n · m           # anti-ban capacity grows LINEARLY in pool size
-```
-
-### 2. Tor NEWNYM circuit rotation — `anonymity.rotate_tor_circuit()`
-
-Tor routes traffic through a 3-node circuit (Guard → Middle → **Exit**); the target sees only the
-Exit. `SIGNAL NEWNYM` on the control port (9051) orders the daemon to build fresh circuits:
-
-```
-old:  G₁ → M₁ → E₁   →  site sees IP(E₁)   # listed → blocked
-new:  G₁ → M₂ → E₂   →  site sees IP(E₂)   # different exit, different IP
-```
-
-With `|E| ≈ 1000–1500` live exits:
-
-```
-P(new exit ≠ old exit) = 1 − 1/|E| ≈ 99.9%
-```
-
-Notes: the *Guard* stays stable for months (Tor's own policy) — but it's invisible to the target,
-so it costs nothing. Auth order: `control_auth_cookie` first, control password as fallback,
-unauthenticated last. **Strictly best-effort**: a failed rotation returns `(False, reason)` and
-logs a warning — it never aborts a scrape.
-
-### 3. Block classification — `anonymity.looks_like_block()`
-
-A linear classifier over string markers:
-
-```
-is_block(reason) = ∃ m ∈ {403, 429, 503, cloudflare, captcha, forbidden, banned, blocked}
-                    : m ⊑ lower(reason)          # complexity O(k·|s|)
-```
-
-**Conservative on purpose.** Costs are asymmetric: a false negative costs one wasted retry; a
-false positive throws away a perfectly good identity and burns a Tor circuit for nothing.
-Therefore 404 and "connection refused" are *deliberately not* markers.
-
-### 4. Instant failover — `job_manager._rotate_identity_on_block()`
-
-On a detected block the engine doesn't wait for the scheduled rotation window — it jumps the
-counter ahead and pins the landing identity for the imminent retry (which runs *inside*
-`_fetch_with_retries`, before the next scheduled rotation):
-
-```
-skip         = min(2, n − 1)
-new_identity = pool[(i + skip) mod n]
-```
-
-**The invariant:** the new identity is never the blocked one —
-
-```
-(i + skip) mod n ≠ i   ⟺   skip mod n ≠ 0
-```
-
-which is guaranteed because `1 ≤ skip ≤ n−1`. Why `min(2, n−1)` *exactly*: the upper bound `n−1`
-is forced by the invariant (jumping `n` would land back on the blocked entry); taking **2**
-instead of 1 (when the pool allows) skips over the entry likely blocked in the previous wave too.
-A drift guard re-advances if the pinned identity somehow equals the blocked one.
-
-Retry success follows a **geometric distribution** — if a random identity is clean with
-probability `q`:
-
-```
-P(success within k tries) = 1 − (1 − q)^k
-
-q = 0.8 →  k=1: 80%   k=2: 96%   k=3: 99.2%
-```
-
-### 5. Hybrid pooling — the anti-"Tor blocked" mode
-
-User proxies and the Tor endpoint merge into one pool. If a fraction `f` of the pool is blocked
-(say, every exit on the target's list), a *double* failure requires two independent draws into
-the blocked set:
-
-```
-P(single request hits blocked)  = f
-P(retry ALSO hits blocked)      = f²
-
-# f = 0.2  →  retry fails too only 4% of the time
-#            (vs. 100% pre-failover on a tor-only run)
-```
-
-**The thesis:** independence between identities converts a *likely, repeated* failure into a
-*rare, quadratic* one. Tor's exit IPs stop being a single point of failure.
-
-### 6. Exponential backoff — `job_manager._interruptible_sleep()`
-
-```
-sleep(attempt) = min(2^attempt, 10) seconds    # 2s → 4s → 8s → 8s → 8s
-```
-
-Anti-"retry storm" profile. It also matters against **timing-pattern detection**: WAFs treat
-deterministic machine-like gaps as a bot signal; the exponential curve plus identity rotation
-scatter the timing beyond easy classification.
-
-### Scorecard
+**Exponential backoff** — `min(2^attempt, 10)` seconds. It caps retry storms, and it also scatters timing: deterministic machine-like gaps are their own bot signal.
 
 | Scenario | Without the engine | With the engine |
 |---|---|---|
-| Requests before first block (threshold m per IP) | ≈ m | ≈ n·m |
-| Max distinct exit IPs | 1 | 1 + (proxies) + ~1000 Tor exits |
-| Retry success after a block | ≈ 0% (same IP) | 1 − (1−q)^k → 96% by k=2 |
+| Requests before first block | ≈ m | ≈ n·m |
+| Distinct exit IPs | 1 | 1 + proxies + ~1000 Tor exits |
+| Retry success after a block | ≈ 0% | 96% by k=2 |
 | Consecutive-failure probability (f=0.2) | 20% | 4% |
-| Timing-pattern bot detection | Trivial (uniform gaps) | Scattered by backoff + rotation |
 
 ### Honest limits
 
-- **Behavioral fingerprinting is out of scope.** Targets like Yelp/Cloudflare also model mouse
-  movement, request ordering and JS execution — rotation says nothing there; that's the stealth
-  engine's job (the engine's Chromium stealth + `solve_cloudflare`).
-- **Worst case:** a target that blocks every Tor exit *and* every datacenter range leaves only
-  **residential proxies** — they lead the ops checklist below.
-- **MAC rotation is not implemented on purpose** — it cannot help against websites.
+- **Behavioural fingerprinting is out of scope.** Targets like Yelp also model request ordering and JS execution; rotation says nothing there — that is the stealth engine's job (stealth Chromium + Cloudflare solving).
+- **A target that blocks every Tor exit and every datacenter range** leaves only residential proxies.
+- **MAC rotation is not implemented, on purpose** — it cannot help against websites.
+- **No CAPTCHA solving bypass and no controls circumvention.** When a source blocks automated access, LOGY fails over or reports it — it does not try to defeat the protection.
+- **Respect the sites you crawl.** `robots.txt` is honoured when enabled, and you are responsible for the terms of the sources you point it at.
 
-### Engineering details worth knowing
+### No automated LinkedIn people-search, by design
 
-- **Two proxy schemes, one Tor:** curl-cffi (FAST_HTTP) gets `socks5h://` — the trailing `h`
-  resolves DNS *through* Tor, so the machine's resolver never sees the hostname. Playwright-based
-  engines (Dynamic/Stealth) get `socks5://` — their proxy validator rejects `socks5h`.
-  `_normalize_tor_scheme()` rewrites the scheme per engine, per request.
-- **WebRTC leak blocked on Tor hops:** WebRTC STUN dials *around* SOCKS tunnels and leaks the
-  real IP. `block_webrtc=True` is applied automatically — but only on requests actually
-  tunneling through Tor (`_is_tor()`), not on plain-proxy hybrid requests.
-- **Startup probe:** tor mode checks `127.0.0.1:9050` once and reports clearly if it's dead —
-  instead of failing every request with the same confusing error.
-- **Per-request pinning:** `_prepare_proxy()` writes the chosen identity into
-  `options.proxy.proxies[0]` — the single field every engine and enrichment path reads, so one
-  write covers the main crawl plus detail-page/qualifier/owner-lookup fetches.
-- **Encrypted at rest:** proxy credentials are never written to logs or exports.
+LOGY can read an owner's LinkedIn URL **if a company publishes it on its own site**. It never searches LinkedIn for a person. That is a different risk category — anti-bot measures plus privacy law around processing identifiable individuals — so it is deliberately not built.
 
-### Ops checklist
+## Included sources
 
-1. **Start Tor Browser (or `tor.exe`) first** — the SOCKS port is 9050, control 9051 by default.
-2. **Residential > datacenter.** Datacenter ranges get flagged almost as fast as Tor exits.
-3. **Keep `block_webrtc` on** for Tor hops (automatic).
-4. **Pin your exits** — `torrc`: `ExitNodes {us},{de}` + `StrictNodes 1`, to choose exit
-   countries the target doesn't blanket-block.
+| Source | Status | Notes |
+|---|---|---|
+| yellowpages.com | Built-in, verified | Niche + city search, paginated |
+| Yelp | Built-in, verified | Stealth engine; respects `robots.txt` |
+| Thumbtack | Built-in, verified | What the site actually publishes (business, rating, profile link) |
+| Your own site | Custom source | Add a domain + container/field selectors from inside the app |
+| ICP-discovered sources | Automatic | Found by the internal search layer and qualified against your ICP |
 
----
-
-## Architecture
-
-```
-UI (PySide6)
- └─ JobManager (QThread)              app/core/job_manager.py
-     ├─ anonymity.py                  # NEW: identity rotation, Tor control, block detection
-     ├─ fetch_engine.py          # the ONLY module importing the fetch engine
-     ├─ extractor.py / ai_extractor.py
-     ├─ dedupe.py                     # cross-job lead history
-     └─ storage/db.py (sqlite3, thread-safe)
-```
-
-- **UI → Job Manager → Scraping Engine → the fetch engine** boundary; the UI never touches the fetch engine.
-- the fetch engine fetcher modes: `FAST_HTTP` (curl-cffi, TLS impersonation), `DYNAMIC` (Chromium),
-  `STEALTH` (Chromium stealth, Cloudflare solving).
-- Sources are pluggable profiles (`builtin_templates.py`) — per-site containers/fields/detail configs.
-- AI Auto-Extract mode: no selectors; an LLM reads page text and fills field names
-  (Anthropic/OpenAI). Owner-lookup enrichment reads a lead's own published site only —
-  no automated LinkedIn people-search, by design.
-
-## Run
-
-```bat
-run.bat          # Windows — points system Python 3.14 at the venv's site-packages
-```
-
-or
+## Tests
 
 ```bash
-pip install scrapling && scrapling install
-python main.py
+python -m pytest tests/ -q
 ```
 
-Tests:
-
-```bash
-python tests/run_tests.py        # 102/103 passing (1 pre-existing qualifier fixture failure)
-```
+216 tests cover storage, the job manager and resume flow, the fetch engine, the anonymity helpers, extraction, de-duplication, the search schema/providers/service/API, and the ICP module.
 
 ## Layout
 
 ```
 app/
   core/
-    engine/        # anonymity.py, fetch_engine.py, extractor.py, ai_extractor.py,
-                   # builtin_templates.py, dedupe.py, qualifier.py, nl_to_fields.py
+    engine/        # fetch_engine, anonymity, brain, extractor, ai_extractor,
+                   # builtin_templates, dedupe, qualifier, tor_runtime
+    search/        # LOGY Search: providers, service, schema, urls, icp, metrics, api
     job_manager.py # QThread worker: queue, retries, failover, enrichment
     exports/       # CSV / JSON / JSONL / XLSX / Odoo exporters
     storage/       # db.py (thread-safe sqlite3), secrets.py (DPAPI-backed)
   ui/              # main_window, sidebar, theme (dark QSS), screens/, widgets/, dialogs/
+docs/assets/readme # README screenshots and banner
 main.py            # entry point
 run.bat            # Windows launcher
-design_prototypes/ # HTML design docs incl. the full engineering deep-dive page
 ```
+
+## License
+
+MIT © 2026 Neutron. See [LICENSE](LICENSE).
