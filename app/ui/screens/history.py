@@ -148,6 +148,14 @@ class HistoryScreen(QWidget):
     # ------------------------------------------------------------------
     def _delete_history(self):
         try:
+            if self.db.count_jobs() == 0:
+                # Empty-history guard (audit QA BUG-003): the disabled
+                # button covers mouse users, but the handler can still be
+                # triggered (keyboard navigation / programmatically) -
+                # show the empty state instead of a delete dialog for
+                # nothing.
+                QMessageBox.information(self, "Delete History", "History is already empty - nothing to delete.")
+                return
             running = self.db.count_running_jobs()
             if running:
                 QMessageBox.warning(
