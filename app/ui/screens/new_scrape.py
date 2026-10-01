@@ -794,7 +794,7 @@ class NewScrapeScreen(QWidget):
         self.max_depth_spin.setRange(0, 20)
         self.max_depth_spin.setValue(1)
         self.robots_chk = QCheckBox("Respect robots.txt")
-        self.robots_chk.setChecked(True)
+        self.robots_chk.setChecked(False)
         self.include_patterns_input = QLineEdit()
         self.include_patterns_input.setPlaceholderText("*/products/* (comma-separated)")
         self.exclude_patterns_input = QLineEdit()
@@ -1431,6 +1431,9 @@ class NewScrapeScreen(QWidget):
             "Maximum privacy",
             "Maximum (recommended)",
         ])
+        # الافتراضي: الاتصال المباشر زي ما كان - هو اللي كان شغال ويجيب ليدز.
+        # Tor بيدخل تلقائيا "وقت الحاجة" بس: أول ما نطاق يتع park بسبب حجب،
+        # الـ worker يصعّد لهذا الكامبين على Tor (شوف job_manager parking rescue).
         self.proxy_list_input = QPlainTextEdit()
         self.proxy_list_input.setPlaceholderText("http://user:pass@host:port  (one per line)")
         self.proxy_list_input.setFixedHeight(70)
@@ -1695,7 +1698,7 @@ class NewScrapeScreen(QWidget):
         proxies = [] if proxy_mode in ("tor",) else [p.strip() for p in self.proxy_list_input.toPlainText().splitlines() if p.strip()]
 
         return ScrapeOptions(
-            fetcher_mode=self.fetcher_combo.currentData(),
+            fetcher_mode=FetcherMode(self.fetcher_combo.currentData() or "fast_http"),
             headless=self.headless_chk.isChecked(),
             concurrency=self.concurrency_spin.value(),
             delay_ms=self.delay_spin.value(),
@@ -1758,7 +1761,9 @@ class NewScrapeScreen(QWidget):
         from app.core.storage import secrets as _secrets
         d = dict(options.__dict__)
         d.pop("proxy", None)  # rebuilt below - credentials never in plain JSON (audit C2)
-        d["fetcher_mode"] = options.fetcher_mode.value
+        d["fetcher_mode"] = (options.fetcher_mode.value
+                             if isinstance(options.fetcher_mode, FetcherMode)
+                             else str(options.fetcher_mode))
         d["proxy"] = {
             "mode": options.proxy.mode,
             # credentials live encrypted-at-rest; a redacted copy stays
@@ -1816,24 +1821,26 @@ class NewScrapeScreen(QWidget):
             return
         container = self._collect_container()
 
-        self.run_panel.setVisible(True)
-        self.log_panel.clear()
-        self.status_label.setText("RUNNING")
-        self.campaign_hint.setText("Collecting leads · auto-protected")
-        self.start_btn.setVisible(False)
-        self.pause_btn.setVisible(True)
-        self.stop_btn.setVisible(True)
-        self.pause_btn.setText("Pause")
-
         # prepare_job() builds the worker/thread but does NOT start it -
         # every signal below gets connected first, THEN
         # start_prepared_job() actually starts the thread. Doing it the
         # other way around (start, then connect) is a race that can miss
         # the run's earliest log/progress/status emissions entirely - see
         # JobManager.prepare_job()'s docstring for the full explanation.
-        job_id, worker = self.job_manager.prepare_job(
-            None, target, fields, options, container, self._active_detail_config, self._active_source_profiles
-        )
+        # (audit QA BUG-004): this ALSO must happen BEFORE the UI is
+        # switched to the RUNNING state - prepare_job can raise (the
+        # double-start guard fires inside the thread-teardown window
+        # right after a previous job finishes), and the old order left
+        # the screen stuck showing RUNNING with the Start button hidden
+        # and no job behind it. Fail the click cheaply instead.
+        try:
+            job_id, worker = self.job_manager.prepare_job(
+                None, target, fields, options, container, self._active_detail_config, self._active_source_profiles
+            )
+        except RuntimeError as e:
+            QMessageBox.warning(self, "Start", str(e))
+            return
+
         self.current_job_id = job_id
         self._job_start_ts = __import__("time").time()
 
@@ -1846,6 +1853,15 @@ class NewScrapeScreen(QWidget):
         self.results_model = ResultsTableModel(self.db, job_id)
         self.results_view.setModel(self.results_model)
         self._bind_quality_pills()
+
+        self.run_panel.setVisible(True)
+        self.log_panel.clear()
+        self.status_label.setText("RUNNING")
+        self.campaign_hint.setText("Collecting leads · auto-protected")
+        self.start_btn.setVisible(False)
+        self.pause_btn.setVisible(True)
+        self.stop_btn.setVisible(True)
+        self.pause_btn.setText("Pause")
 
         # start from a clean, moving bar: 0% now, real percentage as the
         # progress signal reports done/known-work, 100% on finish
