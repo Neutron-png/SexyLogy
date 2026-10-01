@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QEasingCurve, QPropertyAnimation, Qt, Signal
+from PySide6.QtCore import QObject, QEasingCurve, QPropertyAnimation, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut, QIcon, QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QStackedWidget, QApplication, QGraphicsOpacityEffect,
@@ -130,20 +130,19 @@ class MainWindow(QMainWindow):
         self.projects_screen.open_project.connect(self._open_project_in_new_scrape)
         self.templates_screen.use_template.connect(self._use_template_in_new_scrape)
         self.history_screen.resume_requested.connect(self._resume_job_in_new_scrape)
-
         # Crash recovery sweep (audit C3): anything still 'running' with no
         # recent heartbeat is from a dead process - mark INTERRUPTED and
         # recompute its counters from the committed results, so History
         # stops lying about jobs that died with the app.
-        try:
-            stale = self.db.mark_stale_running_as_interrupted()
-            if stale:
-                self.new_scrape_screen.log_panel.append_entry(
-                    "WARNING",
-                    f"{len(stale)} مهمة كانت شغالة لما التطبيق اتقفل - اتعلّمت INTERRUPTED وتقدر تستأنفها",
-                )
-        except Exception:
-            pass  # the sweep must never block startup
+        # (audit QA BUG-006): the sweep used to run ONCE here, so an app
+        # restart inside the 90s heartbeat window after a crash left the
+        # orphaned job 'running' forever - no Resume button, no recovery
+        # short of another restart. It now re-runs on a timer.
+        self._run_recovery_sweep()
+        self._recovery_sweep_timer = QTimer(self)
+        self._recovery_sweep_timer.setInterval(60_000)
+        self._recovery_sweep_timer.timeout.connect(self._run_recovery_sweep)
+        self._recovery_sweep_timer.start()
 
         # Engine diagnostics (official optional-dependencies check): scrapling
         # import + fetchers extras + browser binaries. A missing piece shows
@@ -244,6 +243,24 @@ class MainWindow(QMainWindow):
         continue the job from its checkpoint (audit C3/H1)."""
         self._navigate("new_scrape")
         self.new_scrape_screen._resume_job(job_id)
+
+    def _run_recovery_sweep(self):
+        """Mark orphaned 'running' jobs (dead process, no heartbeat in the
+        90s window) as INTERRUPTED. Runs at startup AND every 60s (audit
+        QA BUG-006). Skipped while a job is running in THIS process: a
+        paused or mid-long-stealth-fetch live job writes no logs and must
+        never be judged stale by its own app."""
+        if self.job_manager.is_running:
+            return
+        try:
+            stale = self.db.mark_stale_running_as_interrupted()
+        except Exception:
+            return  # the sweep must never break the app
+        if stale:
+            self.new_scrape_screen.log_panel.append_entry(
+                "WARNING",
+                f"{len(stale)} مهمة كانت شغالة لما التطبيق اتقفل - اتعلّمت INTERRUPTED وتقدر تستأنفها",
+            )
 
     def _update_engine_status(self):
         """Run the official optional-dependencies diagnostics and mirror
