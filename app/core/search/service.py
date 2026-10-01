@@ -25,7 +25,7 @@ from typing import Optional
 from app.core.search import urls as urls_mod
 from app.core.search.metrics import SearchCache, SearchMetrics, DEFAULT_TTL_S
 from app.core.search.providers import (
-    DDGHTMLProvider, ProviderFailure, SearXNGProvider,
+    BingHTMLProvider, DDGHTMLProvider, ProviderFailure, SearXNGProvider,
     http_client,
 )
 from app.core.search.schema import (
@@ -71,10 +71,11 @@ class SearchService:
     # ---------------- provider chain ----------------
     def _providers(self, request: SearchRequest) -> list:
         """Ordered providers able to serve this request type. 'auto':
-        DDG first (zero infra), then SearXNG only when the user actually
-        configured a base URL."""
+        DDG first, then Bing HTML as the free fallback (a blocked/
+        challenged engine never becomes a dead end), then SearXNG only
+        when the user actually configured a base URL."""
         searxng_base = (self.config.get("searxng_base_url") or "").strip()
-        chain: list = [DDGHTMLProvider()]
+        chain: list = [DDGHTMLProvider(), BingHTMLProvider()]
         if searxng_base:
             chain.append(SearXNGProvider(base_url=searxng_base))
         primary = self.config.get("primary", "auto")

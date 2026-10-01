@@ -23,6 +23,45 @@ def test_unwrap_search_redirects():
     assert unwrap_redirect("https://example.org/direct") == "https://example.org/direct"
 
 
+def test_unwrap_bing_base64_redirect():
+    """Bing ck/a links carry `u=a1<base64url>` - the real destination."""
+    import base64
+    dest = "https://www.yelp.com/search?find_desc=Pool+Builders"
+    b64 = "a1" + base64.urlsafe_b64encode(dest.encode()).decode().rstrip("=")
+    from app.core.search.urls import normalize_url
+    assert normalize_url(f"https://www.bing.com/ck/a?!&p=x&u={b64}&ntb=1").startswith("https://www.yelp.com/")
+
+
+def test_dedupe_preserves_first_position():
+    urls = [
+        "https://a.com/x?utm_source=t",
+        "https://a.com/x",
+        "https://b.com/y",
+        "https://a.com/x",
+        "junk",
+    ]
+    assert dedupe_urls(urls) == ["https://a.com/x", "https://b.com/y"]
+    # www vs apex are distinct hosts for URL-dedup; domain_of unifies them
+    urls2 = ["https://a.com/x", "https://www.a.com/x"]
+    assert len(dedupe_urls(urls2)) == 2
+    assert domain_of(urls2[0]) == domain_of(urls2[1])
+
+
+def test_domain_of():
+    assert domain_of("https://www.sub.Example.com:443/a?b=1") == "sub.example.com"
+    assert domain_of("junk") == ""
+
+
+def test_ssrf_guard():
+    assert is_safe_outbound_url("https://example.com") is True
+    assert is_safe_outbound_url("http://127.0.0.1/x") is False
+    assert is_safe_outbound_url("http://localhost/x") is False
+    assert is_safe_outbound_url("file:///etc/passwd") is False
+    assert is_safe_outbound_url("http://169.254.169.254/meta") is False
+    assert is_safe_outbound_url("http://192.168.1.1/") is False
+    assert is_safe_outbound_url("") is False
+
+
 def test_request_validation():
     import pytest
     from pydantic import ValidationError

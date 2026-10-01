@@ -10,9 +10,8 @@ instance doesn't return come back as empty arrays, never faked.
 """
 from __future__ import annotations
 
+from typing import Any
 from urllib.parse import urlencode
-
-import httpx
 
 from app.core.search.providers.base import SearchProvider, raise_provider_failure
 from app.core.search.schema import (
@@ -43,7 +42,7 @@ class SearXNGProvider(SearchProvider):
             params["language"] = request.language
         return params
 
-    async def search(self, request: SearchRequest, client: httpx.AsyncClient) -> ResultBlocks:
+    async def search(self, request: SearchRequest, client: Any) -> ResultBlocks:
         try:
             resp = await client.get(f"{self.base_url}/search", params=self._params(request))
             resp.raise_for_status()

@@ -5,10 +5,11 @@ from app.core.search.providers.base import (
     raise_provider_failure,
 )
 from app.core.search.providers.ddg_html import DDGHTMLProvider
+from app.core.search.providers.bing_html import BingHTMLProvider
 from app.core.search.providers.searxng import SearXNGProvider
 
 __all__ = [
     "SearchProvider", "ProviderCapabilities", "ProviderFailure",
-    "DDGHTMLProvider", "SearXNGProvider",
+    "DDGHTMLProvider", "BingHTMLProvider", "SearXNGProvider",
     "http_client", "raise_provider_failure",
 ]

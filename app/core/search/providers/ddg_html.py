@@ -19,8 +19,8 @@ from __future__ import annotations
 import html as _html
 import re
 from html.parser import HTMLParser
-
-import httpx
+from typing import Any
+from urllib.parse import parse_qsl, quote
 
 from app.core.search.providers.base import (
     SearchProvider, ProviderCapabilities, ProviderFailure, raise_provider_failure,
@@ -192,7 +192,7 @@ class DDGHTMLProvider(SearchProvider):
             params["df"] = "w"
         return params
 
-    async def search(self, request: SearchRequest, client: httpx.AsyncClient) -> ResultBlocks:
+    async def search(self, request: SearchRequest, client: Any) -> ResultBlocks:
         try:
             resp = await client.get(HTML_ENDPOINT, params=self._params(request))
             resp.raise_for_status()

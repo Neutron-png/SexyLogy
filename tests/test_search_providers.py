@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.search.schema import ProviderFailure, SearchRequest
 from app.core.search.providers.ddg_html import DDGHTMLProvider, parse_results
+from app.core.search.providers.bing_html import BingHTMLProvider, parse_results as parse_bing
 from app.core.search.providers.searxng import SearXNGProvider
 
 # Representative snapshot of the html.duckduckgo.com result markup
@@ -122,13 +123,77 @@ def test_searxng_parse_and_slice():
 
 
 def test_provider_failure_mapping():
-    import httpx
+    from curl_cffi.requests.exceptions import HTTPError, Timeout
+    from curl_cffi import CurlError
     from app.core.search.providers.base import raise_provider_failure
 
-    req = httpx.Request("GET", "https://x.com")
-    resp403 = httpx.Response(403, request=req)
-    assert raise_provider_failure("p", httpx.HTTPStatusError("x", request=req, response=resp403)).kind == "blocked"
-    resp500 = httpx.Response(500, request=req)
-    assert raise_provider_failure("p", httpx.HTTPStatusError("x", request=req, response=resp500)).kind == "unavailable"
-    assert raise_provider_failure("p", httpx.ConnectTimeout("t", request=req)).kind == "timeout"
-    assert raise_provider_failure("p", httpx.ConnectError("n")).kind == "network"
+    assert raise_provider_failure("p", Timeout("t")).kind == "timeout"
+    assert raise_provider_failure("p", CurlError("reset")).kind == "network"
+    err = HTTPError("403")
+    err.response = type("R", (), {"status_code": 403})()
+    assert raise_provider_failure("p", err).kind == "blocked"
+    err.response.status_code = 500
+    assert raise_provider_failure("p", err).kind == "unavailable"
+
+
+def test_http_client_never_proxies():
+    """User decision: the search layer is direct curl - the proxy arg is
+    accepted but deliberately ignored, and no proxy rides on sessions."""
+    from app.core.search.providers.base import http_client, CurlSession
+    c = http_client(proxy="socks5://127.0.0.1:9050")
+    assert isinstance(c, CurlSession)
+
+
+# Representative snapshot of Bing's server-rendered result markup.
+BING_SAMPLE = """
+<ol id="b_results">
+  <li class="b_algo">
+    <h2><a href="https://www.poolcorp.com/?utm_source=bing">POOLCORP - Swimming Pool Supplies</a></h2>
+    <div class="b_caption"><p>Pool supplies distributor worldwide.</p></div>
+  </li>
+  <li class="b_algo">
+    <h2><a href="https://www.another.com/page">Another Link</a></h2>
+    <div class="b_caption"><p>Snippet two.</p></div>
+  </li>
+</ol>
+"""
+
+
+def test_bing_parse_results():
+    out = parse_bing(BING_SAMPLE)
+    assert len(out) == 2
+    assert out[0].url == "https://www.poolcorp.com/"   # utm stripped
+    assert out[0].snippet == "Pool supplies distributor worldwide."
+    assert out[1].title == "Another Link"
+
+
+def test_bing_malformed_and_dedupe():
+    assert parse_bing("<html>junk</html>") == []
+    assert len(parse_bing(BING_SAMPLE + BING_SAMPLE)) == 2
+
+
+def test_bing_challenge_page_raises():
+    import asyncio
+    from app.core.search.providers.base import http_client
+
+    class _Resp:
+        status_code = 200
+        text = "<html><body>Verify you are human - captcha challenge</body></html>"
+        def raise_for_status(self): pass
+
+    provider = BingHTMLProvider()
+
+    async def run():
+        client = http_client()
+        async with client:
+            async def fake_get(*a, **k):
+                return _Resp()
+            client.get = fake_get
+            return await provider.search(SearchRequest(query="q"), client)
+
+    try:
+        asyncio.run(run())
+    except ProviderFailure as e:
+        assert e.kind == "blocked"
+    else:
+        raise AssertionError("challenge page did not raise blocked")

@@ -70,6 +70,7 @@ def test_fallback_to_second_provider(tmp_path):
     good = _FakeProvider()
     good.name = "searxng"
     with mock.patch("app.core.search.service.DDGHTMLProvider", return_value=broken), \
+         mock.patch("app.core.search.service.BingHTMLProvider", return_value=_FakeProvider(fail_kind="blocked")), \
          mock.patch("app.core.search.service.SearXNGProvider", return_value=good), \
          mock.patch("app.core.search.service.http_client"), \
          mock.patch("app.core.search.service.asyncio.Semaphore", mock.MagicMock()):
@@ -84,6 +85,7 @@ def test_all_providers_fail_raises_structured_error(tmp_path):
     broken2 = _FakeProvider(fail_kind="timeout")
     broken2.name = "searxng"
     with mock.patch("app.core.search.service.DDGHTMLProvider", return_value=broken), \
+         mock.patch("app.core.search.service.BingHTMLProvider", return_value=_FakeProvider(fail_kind="blocked")), \
          mock.patch("app.core.search.service.SearXNGProvider", return_value=broken2), \
          mock.patch("app.core.search.service.http_client"), \
          mock.patch("app.core.search.service.asyncio.Semaphore", mock.MagicMock()), \
@@ -104,6 +106,7 @@ def test_circuit_breaker_opens_and_skips(tmp_path):
     good = _FakeProvider()
     good.name = "searxng"
     with mock.patch("app.core.search.service.DDGHTMLProvider", return_value=broken), \
+         mock.patch("app.core.search.service.BingHTMLProvider", return_value=bing_broken), \
          mock.patch("app.core.search.service.SearXNGProvider", return_value=good), \
          mock.patch("app.core.search.service.http_client"), \
          mock.patch("app.core.search.service.asyncio.Semaphore", mock.MagicMock()):

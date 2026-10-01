@@ -1,23 +1,80 @@
-"""
-Search provider abstraction - the ONLY seam between LOGY and upstream
+"""Search provider abstraction - the ONLY seam between LOGY and upstream
 search engines. LOGY never talks to an engine directly (architectural
-principle: no engine hard-coding outside providers/)."""
+principle: no engine hard-coding outside providers/).
+
+HTTP layer: curl_cffi with Chrome TLS impersonation - direct connection,
+NEVER proxied (the user's decision: the search layer uses curl, not the
+crawler's proxy/Tor settings; those stay crawler-only). No key, no
+browser, no CAPTCHA bypassing - if an engine blocks the request we
+fail with kind='blocked' and the service falls back or errors.
+"""
 from __future__ import annotations
 
 import abc
-from typing import Optional
+from typing import Any, Optional
 
-import httpx
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import HTTPError, RequestException, Timeout
 
 from app.core.search.schema import (
     ProviderCapabilities, ProviderFailure, ResultBlocks, SearchRequest,
 )
 
+DEFAULT_TIMEOUT_S = 15.0
+
+
+class CurlSession:
+    """Thin async wrapper so providers keep a simple client surface
+    (get/raise_for_status/text/json) with impersonated Chrome TLS -
+    and a hard guarantee: no proxy is ever attached here."""
+
+    def __init__(self, timeout_s: float = DEFAULT_TIMEOUT_S):
+        self._timeout = timeout_s
+        self._session: Optional[AsyncSession] = None
+
+    async def __aenter__(self):
+        self._session = AsyncSession(impersonate="chrome")
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc):
+        return await self._session.__aexit__(*exc)
+
+    async def get(self, url: str, **kwargs) -> Any:
+        kwargs.setdefault("timeout", self._timeout)
+        return await self._session.get(url, **kwargs)
+
+
+def http_client(timeout_s: float = DEFAULT_TIMEOUT_S, proxy: Optional[str] = None) -> CurlSession:
+    """Kept name for callers; `proxy` is accepted-but-ignored BY DESIGN:
+    the search layer is explicitly direct-curl, never proxied (user
+    decision). Providers needing a proxy in the future must define their
+    own contract, visibly."""
+    del proxy  # deliberate: never proxied
+    return CurlSession(timeout_s=timeout_s)
+
+
+def raise_provider_failure(provider: str, exc: Exception) -> ProviderFailure:
+    """Map curl/network exceptions to the structured failure kinds the
+    service uses for fallback/breaker decisions."""
+    if isinstance(exc, Timeout):
+        return ProviderFailure(provider, "timeout", str(exc))
+    if isinstance(exc, HTTPError):
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        kind = "blocked" if code in (403, 429, 503) else "unavailable"
+        return ProviderFailure(provider, kind, f"HTTP {code}")
+    if isinstance(exc, RequestException):
+        return ProviderFailure(provider, "network", str(exc))
+    if isinstance(exc, Exception):
+        # curl_cffi also raises bare CurlError subclasses for transport
+        # problems (connect/reset) - treat as network
+        return ProviderFailure(provider, "network", str(exc))
+    return ProviderFailure(provider, "unavailable", str(exc))
+
 
 class SearchProvider(abc.ABC):
-    """One upstream engine. Async (httpx) so the service can run many
-    searches concurrently without browsers; a provider launches browser
-    processes only if IT genuinely needs to (none of the built-ins do).
+    """One upstream engine. Async (curl_cffi impersonated, direct) so
+    the service can run many searches concurrently without browsers.
 
     Contract: return normalized ResultBlocks or raise ProviderFailure.
     NEVER return fabricated data - if a block can't be parsed, the block
@@ -31,33 +88,5 @@ class SearchProvider(abc.ABC):
         return bool(requested)
 
     @abc.abstractmethod
-    async def search(self, request: SearchRequest, client: httpx.AsyncClient) -> ResultBlocks:
+    async def search(self, request: SearchRequest, client: Any) -> ResultBlocks:
         ...
-
-
-def http_client(timeout_s: float = 15.0, proxy: Optional[str] = None) -> httpx.AsyncClient:
-    """Connection-pooled async client with a bounded timeout. Follows
-    redirects (providers redirect); verifies TLS by default; optional
-    egress proxy for environments that require one."""
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(timeout_s, connect=10.0),
-        follow_redirects=True,
-        proxy=proxy,
-        headers={"User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")},
-    )
-
-
-def raise_provider_failure(provider: str, exc: Exception) -> ProviderFailure:
-    """Map httpx/network exceptions to the structured failure kinds the
-    service uses for fallback/breaker decisions."""
-    if isinstance(exc, httpx.TimeoutException):
-        return ProviderFailure(provider, "timeout", str(exc))
-    if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
-        kind = "blocked" if code in (403, 429, 503) else "unavailable"
-        return ProviderFailure(provider, kind, f"HTTP {code}")
-    if isinstance(exc, httpx.HTTPError):
-        return ProviderFailure(provider, "network", str(exc))
-    return ProviderFailure(provider, "unavailable", str(exc))

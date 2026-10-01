@@ -7,6 +7,7 @@ first occurrence's ranking position.
 """
 from __future__ import annotations
 
+import base64
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 # Tracking params stripped on normalization - they bloat cache keys,
@@ -14,17 +15,30 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 _TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "gclid", "fbclid", "msclkid", "dclid", "yclid", "igshid", "mc_cid",
-    "mc_eid", "_ga", "ref", "ref_src",
+    "mc_eid", "_ga", "ref", "ref_src", "msockid", "msn", "form", "sc",
 }
 
 # query params whose value is itself an encoded destination URL
 _ENCODED_URL_PARAMS = {"uddg", "url", "u", "target"}
 
 
+def _decode_bing_u(value: str) -> str:
+    """Bing's ck/a links encode the destination as `u=a1<base64url>`
+    (padding stripped). Everything else passes through."""
+    if value.startswith("a1"):
+        raw = value[2:]
+        raw += "=" * (-len(raw) % 4)
+        try:
+            return base64.urlsafe_b64decode(raw).decode("utf-8", errors="ignore")
+        except Exception:
+            return value
+    return value
+
+
 def unwrap_redirect(url: str) -> str:
     """Search providers wrap destinations in their own redirectors
-    (duckduckgo.com/l/?uddg=<encoded>, google url?q=...). Unwrap one
-    level; unknown wrappers pass through
+    (duckduckgo.com/l/?uddg=<encoded>, bing.com/ck/a?u=a1<base64>,
+    google url?q=...). Unwrap one level; unknown wrappers pass through
     untouched."""
     if not url:
         return url
@@ -37,6 +51,10 @@ def unwrap_redirect(url: str) -> str:
     for p in _ENCODED_URL_PARAMS:
         if p in qs and qs[p].startswith(("http://", "https://", "//")):
             return unquote(qs[p])
+    if parsed.netloc.lower() == "www.bing.com" and "u" in qs:
+        decoded = _decode_bing_u(qs["u"])
+        if decoded.startswith(("http://", "https://")):
+            return decoded
     return url
 
 
