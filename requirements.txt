@@ -5,3 +5,15 @@ openpyxl>=3.1
 xlwt>=1.3
 requests>=2.31
 pytest>=8.0
+httpx>=0.27
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# --- LOGY Search (app/core/search): zero-cost internal SERP layer ---
+# httpx: async I/O for search providers (isolated from scrapling's crawler)
+# fastapi+uvicorn: OPTIONAL local-only debug/playground API (127.0.0.1, opt-in)
+
+# --- Tor runtime (auto-started by LOGY on launch - see app/core/engine/tor_runtime.py) ---
+# Tor is a binary, not a pip package: fetch the official Expert Bundle once with
+#   python tools/setup_tor.py
+# (main.py boots it in the background; tor/hybrid proxy modes go live when it's up)
