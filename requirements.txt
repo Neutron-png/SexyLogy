@@ -8,10 +8,13 @@ pytest>=8.0
 httpx>=0.27
 fastapi>=0.110
 uvicorn[standard]>=0.29
+pypdf>=4.0
+python-docx>=1.1
 
 # --- LOGY Search (app/core/search): zero-cost internal SERP layer ---
 # httpx: async I/O for search providers (isolated from scrapling's crawler)
 # fastapi+uvicorn: OPTIONAL local-only debug/playground API (127.0.0.1, opt-in)
+# pypdf/python-docx: ICP document parsing (PDF/DOCX upload)
 
 # --- Tor runtime (auto-started by LOGY on launch - see app/core/engine/tor_runtime.py) ---
 # Tor is a binary, not a pip package: fetch the official Expert Bundle once with

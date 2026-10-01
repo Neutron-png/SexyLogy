@@ -157,6 +157,18 @@ CREATE TABLE IF NOT EXISTS search_log (
     ts REAL NOT NULL
 );
 
+-- Structured ICP profiles (ICP Intelligence): the reviewed/edited
+-- representation the user approved after upload+analysis. Raw document
+-- text is NOT stored here - only the structured profile (and the
+-- source file name/hash for provenance).
+CREATE TABLE IF NOT EXISTS icp_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    structured_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
