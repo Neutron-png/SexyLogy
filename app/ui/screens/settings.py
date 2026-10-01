@@ -29,11 +29,65 @@ class SettingsScreen(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self._general_tab(), "General")
         tabs.addTab(self._scraping_tab(), "Scraping")
+        tabs.addTab(self._search_tab(), "Search")
         tabs.addTab(self._odoo_export_tab(), "Odoo Export")
         tabs.addTab(self._browser_tab(), "Browser")
         tabs.addTab(self._storage_tab(), "Storage")
         tabs.addTab(self._advanced_tab(), "Advanced")
         layout.addWidget(tabs, 1)
+
+    def _search_tab(self) -> QWidget:
+        """LOGY Search (app/core/search) provider settings - the
+        zero-cost internal SERP layer. Persisted under 'search_config';
+        SearchService re-reads it per construction."""
+        from app.core.search.service import DEFAULT_CONFIG
+
+        w = QWidget()
+        form = QFormLayout(w)
+        cfg = self.db.get_setting("search_config", {}) or {}
+
+        provider = QComboBox()
+        provider.addItems(["auto", "ddg_html", "searxng"])
+        provider.setCurrentText(cfg.get("primary", DEFAULT_CONFIG["primary"]))
+        searxng_url = QLineEdit(cfg.get("searxng_base_url", ""))
+        ttl = QSpinBox()
+        ttl.setRange(60, 86400 * 7)
+        ttl.setValue(int(cfg.get("cache_ttl_s", DEFAULT_CONFIG["cache_ttl_s"])))
+        interval = QSpinBox()
+        interval.setRange(0, 60)
+        interval.setValue(int(cfg.get("min_interval_s", DEFAULT_CONFIG["min_interval_s"])))
+        concurrency = QSpinBox()
+        concurrency.setRange(1, 8)
+        concurrency.setValue(int(cfg.get("max_concurrency", DEFAULT_CONFIG["max_concurrency"])))
+
+        def _save():
+            self.db.set_setting("search_config", {
+                "primary": provider.currentText(),
+                "searxng_base_url": searxng_url.text().strip(),
+                "cache_ttl_s": ttl.value(),
+                "min_interval_s": interval.value(),
+                "max_concurrency": concurrency.value(),
+            })
+
+        provider.currentTextChanged.connect(lambda *_: _save())
+        searxng_url.textChanged.connect(lambda *_: _save())
+        ttl.valueChanged.connect(lambda *_: _save())
+        interval.valueChanged.connect(lambda *_: _save())
+        concurrency.valueChanged.connect(lambda *_: _save())
+
+        form.addRow("Default provider", provider)
+        form.addRow("SearXNG base URL (optional)", searxng_url)
+        form.addRow("Search cache TTL (s)", ttl)
+        form.addRow("Min interval between searches (s)", interval)
+        form.addRow("Max concurrent searches", concurrency)
+        note = QLabel(
+            "LOGY's own zero-cost search layer (no Serper/SerpAPI keys needed). "
+            "'auto' uses the built-in free provider, with SearXNG as fallback "
+            "when a base URL is set."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        return w
 
     def _general_tab(self) -> QWidget:
         w = QWidget()
