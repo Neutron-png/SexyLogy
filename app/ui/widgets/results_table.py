@@ -102,7 +102,13 @@ class ResultsTableModel(QAbstractTableModel):
         seen = set()
         for row in sample:
             import json
-            data = json.loads(row["data_json"])
+            try:
+                data = json.loads(row["data_json"])
+            except (TypeError, ValueError):
+                # corrupted row (crash mid-write / manual edit): degrade
+                # to an empty record instead of crashing the whole table
+                # (audit QA BUG-005) - history.py guards the same parse.
+                data = {}
             for k in data.keys():
                 if k not in seen:
                     seen.add(k)
@@ -120,7 +126,10 @@ class ResultsTableModel(QAbstractTableModel):
             rows = self.db.page_results(self.job_id, new_total - 1, 1)
             if rows:
                 import json
-                data = json.loads(rows[0]["data_json"])
+                try:
+                    data = json.loads(rows[0]["data_json"])
+                except (TypeError, ValueError):
+                    data = {}  # corrupted row: show empty cells, never crash (audit QA BUG-005)
                 data["_source_url"] = rows[0]["source_url"]
                 data["_scraped_at"] = rows[0]["scraped_at"]
                 data["_id"] = rows[0]["id"]
@@ -155,7 +164,10 @@ class ResultsTableModel(QAbstractTableModel):
             return
         self.beginInsertRows(QModelIndex(), offset, offset + len(batch) - 1)
         for row in batch:
-            data = json.loads(row["data_json"])
+            try:
+                data = json.loads(row["data_json"])
+            except (TypeError, ValueError):
+                data = {}  # corrupted row: show empty cells, never crash (audit QA BUG-005)
             data["_source_url"] = row["source_url"]
             data["_scraped_at"] = row["scraped_at"]
             data["_id"] = row["id"]

@@ -19,7 +19,12 @@ def _rows(results: Iterable[dict]) -> Iterator[dict]:
     """Each stored result row is {id, job_id, source_url, data_json, scraped_at}.
     Flatten it to {**data, source_url, scraped_at} for export."""
     for r in results:
-        data = json.loads(r["data_json"]) if isinstance(r.get("data_json"), str) else dict(r.get("data", {}))
+        # corrupted data_json (crash mid-write / manual edit): degrade to
+        # an empty record so the export still completes (audit QA BUG-005)
+        try:
+            data = json.loads(r["data_json"]) if isinstance(r.get("data_json"), str) else dict(r.get("data", {}))
+        except ValueError:
+            data = {}
         flat = dict(data)
         flat["source_url"] = r.get("source_url")
         flat["scraped_at"] = r.get("scraped_at")
